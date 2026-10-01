@@ -161,10 +161,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let snapshot = DevSnapshot.directory
         if let snapshot { Task { await DevSnapshot.run(into: snapshot) } }
 
-        // コマンドライン引数で渡されたファイル (open -a Kanade --args ...)
-        let paths = CommandLine.arguments.dropFirst().filter {
-            !$0.hasPrefix("-") && $0 != snapshot?.path && FileManager.default.fileExists(atPath: $0)
-        }
+        // コマンドライン引数で渡されたファイル (open -a Kanade --args ...)。「--名前 値」の形のオプションの値は、ファイルとして扱わない
+        let arguments = Array(CommandLine.arguments.dropFirst())
+        let paths = arguments.enumerated().filter { i, argument in
+            !argument.hasPrefix("-") && !(i > 0 && arguments[i - 1].hasPrefix("--")) && FileManager.default.fileExists(atPath: argument)
+        }.map(\.element)
         if !paths.isEmpty { model.open(paths.map { URL(fileURLWithPath: $0) }) }
 
         // 引数やファイル付きで起動されると SwiftUI がメインウィンドウを開かないことがあるので保険

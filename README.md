@@ -3,6 +3,20 @@
 SwiftUI と AVAudioEngine で作った macOS 26 以降向けのネイティブアプリです。
 ロスレス・ハイレゾから DSD・APE などの珍しい形式まで再生できます。元のデータを 1 ビットも変えない出力、ヘッドホン補正用のパラメトリック EQ、ライブラリとプレイリスト、レコードプレイヤーやカセットデッキの見た目、ASMR 向けの再生モードを備えています。
 
+<p align="center">
+  <img src="docs/screenshots/main.png" width="820" alt="再生画面。大きなアルバムアート、波形つきのシークバー、右に再生キュー">
+</p>
+<p align="center">
+  <img src="docs/screenshots/turntable.png" width="49%" alt="レコードプレイヤーの見た目">
+  <img src="docs/screenshots/cassette.png" width="49%" alt="カセットデッキの見た目">
+</p>
+<p align="center">
+  <img src="docs/screenshots/library.png" width="61%" alt="ライブラリのアルバム画面">
+  <img src="docs/screenshots/bit-perfect.png" width="36%" alt="ビットパーフェクト再生中の「出力」タブ。音源から出力までのシグナルパスが表示されている">
+</p>
+
+上から、再生画面、見た目を変えたところ（レコードプレイヤー・カセットデッキ）、ライブラリと、ビットパーフェクト再生中の「出力」タブです。写っている曲とジャケットは、撮影用に作った架空のものです。
+
 ## 必要なもの
 
 - macOS 26 以降
@@ -255,6 +269,8 @@ ffmpeg は Homebrew の `/opt/homebrew/bin` などから自動で見つけます
 ```bash
 open -n -g "Kanade Dev.app" --args --snapshot /tmp/kanade-shots
 ```
+
+`--shots library,sound-output` のように名前の先頭を並べると、その画面だけを書き出します（画面の一覧は `Sources/Kanade/App/DevSnapshotCatalog.swift`）。
 
 アイコンを変更するときは `Resources/AppIcon.svg` を編集し、`./scripts/make-icon.sh` を実行してください（描画に Google Chrome を使います）。
 
