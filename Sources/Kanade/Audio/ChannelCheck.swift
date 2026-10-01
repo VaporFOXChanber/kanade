@@ -30,14 +30,15 @@ enum ChannelCheck {
         return (left, right)
     }
 
-    static func makeBuffer() -> AVAudioPCMBuffer? {
+    /// - Parameter gain: アプリの音量 (倍率)。確認音は音量の処理を通らないので、ここで掛けておく
+    static func makeBuffer(gain: Float = 1) -> AVAudioPCMBuffer? {
         let (left, right) = samples()
         guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(left.count)),
               let data = buffer.floatChannelData else { return nil }
         buffer.frameLength = AVAudioFrameCount(left.count)
         for i in 0..<left.count {
-            data[0][i] = left[i]
-            data[1][i] = right[i]
+            data[0][i] = left[i] * gain
+            data[1][i] = right[i] * gain
         }
         return buffer
     }

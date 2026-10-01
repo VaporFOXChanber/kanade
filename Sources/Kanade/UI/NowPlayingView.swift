@@ -165,6 +165,9 @@ struct TrackInfo: View {
             if model.signalPath?.quality == .bitPerfect {
                 Badge(text: "ビットパーフェクト", highlight: model.palette.accent)
                     .help("元のデータを 1 ビットも変えずに出力しています（⌥⌘E の「出力」で道筋を確認できます）")
+            } else if model.signalPath?.quality == .dsdNative {
+                Badge(text: "DSD ネイティブ", highlight: model.palette.accent)
+                    .help("DSD のデータを PCM に変換せず、そのまま DAC へ送っています（DoP）")
             }
         }
     }

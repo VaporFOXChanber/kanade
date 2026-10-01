@@ -86,6 +86,18 @@ final class PlayerModel {
         }
     }
 
+    /// 作品番号 (RJ…) の分かる曲で、アーティストなどのタグが空のとき、DLsite から声優名とサークル名を取得して埋める
+    var dlsiteInfo = Defaults.bool("dlsiteInfo", false) {
+        didSet {
+            Defaults.set("dlsiteInfo", dlsiteInfo)
+            DLsiteCatalog.enabled = dlsiteInfo
+            if dlsiteInfo {
+                fillFromDLsite()
+                LibraryStore.shared.fillFromDLsite()
+            }
+        }
+    }
+
     // MARK: 再生設定
     var shuffle = Defaults.bool("shuffle", false) {
         didSet { Defaults.set("shuffle", shuffle); rebuildShuffle(); engine.invalidateUpcoming() }
@@ -104,7 +116,7 @@ final class PlayerModel {
                 appVolume = newValue
                 return
             }
-            guard deviceVolume != nil, let device = engine.outputDeviceID else { return }
+            guard !volumeLocked, let device = engine.outputDeviceID else { return }
             let value = min(1, max(0, newValue))
             OutputDevice.setVolume(device, Float(value))
             deviceVolume = value
@@ -158,11 +170,40 @@ final class PlayerModel {
     var matchSampleRate = Defaults.bool("matchSampleRate", false) {
         didSet {
             Defaults.set("matchSampleRate", matchSampleRate)
-            engine.matchSampleRate = matchSampleRate || bitPerfect
-            if !engine.matchSampleRate { engine.restoreOutputDevice() }
+            applyOutputPolicy()
             reloadForOutputChange()
         }
     }
+    /// アップサンプリング: 曲の整数倍のサンプルレートにデバイスを切り替え、変換してから送る (ビットパーフェクト再生中は使わない)
+    var upsampling = Upsampling(rawValue: Defaults.string("upsampling") ?? "") ?? .off {
+        didSet {
+            Defaults.set("upsampling", upsampling.rawValue)
+            applyOutputPolicy()
+            reloadForOutputChange()
+        }
+    }
+    /// DSD の曲を、対応を確かめた DAC へそのまま (DoP で) 送る
+    var dopEnabled = Defaults.bool("dopEnabled", false) {
+        didSet {
+            Defaults.set("dopEnabled", dopEnabled)
+            dopRefused.removeAll()
+            engine.invalidateUpcoming()
+            reloadForOutputChange()
+        }
+    }
+    /// 出力デバイスごとの、DoP に対応しているかの確認結果 (デバイスの UID → 結果)
+    private(set) var dopDevices: [String: DoP.Support] = Defaults.codable("dopDevices") ?? [:] {
+        didSet { Defaults.setCodable("dopDevices", dopDevices) }
+    }
+    /// DoP の対応を確かめている途中の状態 (確かめていなければ nil)
+    private(set) var dopCheck: DoPCheck?
+    @ObservationIgnored private var dopCheckResume: (id: UUID, position: Double)?
+    @ObservationIgnored private let dopCheckID = UUID()
+    @ObservationIgnored private var dopFiles: [URL: URL] = [:]
+    @ObservationIgnored private var dopConversions: [URL: Task<URL, Error>] = [:]
+    /// DoP で送ろうとして送れなかった曲 (PCM に変換して再生する)
+    @ObservationIgnored private var dopRefused: Set<URL> = []
+    @ObservationIgnored private var dsdInfoCache: [URL: DSDFile.Info?] = [:]
     /// ビットパーフェクト再生: 音を変える処理をすべて外し、デバイスの形式を曲に合わせ、アプリの音量を最大にして、
     /// 元のデータのまま出力する。EQ などの設定は残したまま使わないだけなので、オフにすれば元に戻る。
     /// 切り替えは setBitPerfect で行う
@@ -319,7 +360,7 @@ final class PlayerModel {
         resumeStore = ResumeStore.load(from: Self.supportDirectory)
         loudness = LoudnessStore.load(from: Self.supportDirectory)
         stats = PlayStats.load(from: Self.supportDirectory)
-        engine.matchSampleRate = matchSampleRate || bitPerfect
+        applyOutputPolicy()
         deviceVolumeObserver.onChange = { [weak self] in MainActor.assumeIsolated { self?.readDeviceVolume() } }
 
         engine.provideNext = { [weak self] in MainActor.assumeIsolated { self?.readyNextItem() } }
@@ -339,7 +380,10 @@ final class PlayerModel {
         refreshDeviceVolume()
         if exclusiveMode { applyExclusiveMode() }
         setupRemoteCommands()
+        DLsiteCatalog.directory = Self.supportDirectory
+        DLsiteCatalog.enabled = dlsiteInfo
         restore()
+        fillFromDLsite()
     }
 
     // MARK: - 参照
@@ -568,6 +612,8 @@ final class PlayerModel {
     // MARK: - 再生
 
     func play(_ track: Track, at seconds: Double = 0, autoplay: Bool = true) {
+        // DoP の確認の途中でほかの曲を選んだら、確認はやめる (音量を元に戻す)
+        if dopCheck != nil { endDoPCheck(resume: false) }
         let token = UUID()
         loadToken = token
         let changed = currentID != track.id
@@ -584,14 +630,22 @@ final class PlayerModel {
 
         Task {
             do {
-                let needsConversion = playable[track.url] == nil
+                let needsConversion = wantsDoP(track) ? dopFiles[track.url] == nil : playable[track.url] == nil
                 if needsConversion { isPreparing = true }
                 if needsLoudness(track) { isPreparing = true }
                 await ensureLoudness(for: track)
-                let item = try await makeItem(track)
+                var item = try await makeItem(track)
                 guard loadToken == token else { return }
                 await engine.prepareOutput(for: item)
                 guard loadToken == token else { return }
+                if item.isDoP, !engine.dopReady(for: item) {
+                    // デバイスを DoP 用の形式に切り替えられなかった: そのまま送ると雑音になるので、PCM に変換して再生する
+                    dopRefused.insert(track.url)
+                    item = try await makeItem(track)
+                    guard loadToken == token else { return }
+                    await engine.prepareOutput(for: item)
+                    guard loadToken == token else { return }
+                }
                 isPreparing = false
                 conversionProgress = nil
                 engine.load(item, at: seconds, play: autoplay)
@@ -623,6 +677,7 @@ final class PlayerModel {
     }
 
     func togglePlay() {
+        guard dopCheck == nil else { return }
         if isPlaying {
             engine.pause()
             isPlaying = false
@@ -942,6 +997,7 @@ final class PlayerModel {
     func selectOutputDevice(_ device: AudioOutputDevice?) {
         // 音を出し始める前に、新しいデバイス側の音量を合わせておく (ビットパーフェクト再生中)
         let target = device?.id ?? AudioOutputs.defaultDeviceID()
+        dopRefused.removeAll()
         moveBitPerfectVolume(to: target, uid: device?.uid ?? outputDevices.first { $0.id == target }?.uid ?? "default")
         outputDeviceUID = device?.uid
         Defaults.set("outputDevice", device?.uid)
@@ -960,6 +1016,16 @@ final class PlayerModel {
     // MARK: - エンジン連携
 
     private func makeItem(_ track: Track) async throws -> PlaybackItem {
+        if wantsDoP(track) {
+            do {
+                let file = try AVAudioFile(forReading: try await dopURL(for: track.url))
+                return PlaybackItem(trackID: track.id, file: file, source: track.url, start: track.start ?? 0, end: track.end,
+                                    gain: 1, isDoP: true)
+            } catch {
+                // DoP に包めなかった曲は、PCM に変換して再生する
+                dopRefused.insert(track.url)
+            }
+        }
         let url = try await playableURL(for: track.url)
         let file = try AVAudioFile(forReading: url)
         return PlaybackItem(trackID: track.id, file: file, source: track.url, start: track.start ?? 0, end: track.end, gain: gain(for: track))
@@ -1137,6 +1203,7 @@ final class PlayerModel {
         Task {
             let ok = await engine.setExclusiveMode(exclusiveMode)
             switchingExclusive = false
+            dopRefused.removeAll()
             outputRevision += 1
             if exclusiveMode, !ok {
                 showToast("排他モードにできませんでした（ほかのアプリが使っているか、このデバイスは対応していません）", symbol: "exclamationmark.triangle")
@@ -1237,10 +1304,18 @@ final class PlayerModel {
         applyRate()
         applyBalance()
         engine.crossfadeDuration = bitPerfect ? 0 : crossfade
-        engine.matchSampleRate = matchSampleRate || bitPerfect
-        if !engine.matchSampleRate { engine.restoreOutputDevice() }
+        applyOutputPolicy()
+        dopRefused.removeAll()
         engine.invalidateUpcoming()
         reloadForOutputChange()
+    }
+
+    /// デバイスの形式をどう切り替えるかを、エンジンへ渡す。どれも使わなくなったら、デバイスを元の形式に戻す
+    private func applyOutputPolicy() {
+        engine.matchSampleRate = matchSampleRate || bitPerfect
+        // 変換が入るので、ビットパーフェクト再生中はアップサンプリングしない
+        engine.upsampling = bitPerfect ? .off : upsampling
+        if !engine.matchSampleRate, engine.upsampling == .off { engine.restoreOutputDevice() }
     }
 
     /// アプリの音量を最大にすると音が大きくなるときに、切り替えてよいかを確かめる
@@ -1258,6 +1333,218 @@ final class PlayerModel {
         return alert.runModal() == .alertSecondButtonReturn
     }
 
+    // MARK: - DSD のネイティブ再生 (DoP)
+
+    /// 今、DoP で送っているか
+    var dopActive: Bool {
+        _ = outputRevision
+        return engine.current?.isDoP == true
+    }
+
+    private func dsdInfo(_ url: URL) -> DSDFile.Info? {
+        guard DSDFile.extensions.contains(url.pathExtension.lowercased()) else { return nil }
+        if let cached = dsdInfoCache[url] { return cached }
+        let info = DSDFile.info(url)
+        dsdInfoCache[url] = info
+        return info
+    }
+
+    /// 今の出力デバイスが、DoP のサンプルレート (rate) で受け付ける整数の形式のうち、ビット数のいちばん多いもの
+    private func integerBits(at rate: Double) -> Int? {
+        guard let device = engine.outputDeviceID, let current = OutputDevice.physicalFormat(device) else { return nil }
+        return OutputDevice.availablePhysicalFormats(device, rate: rate)
+            .filter { !$0.isFloat && $0.channels == current.channels && $0.mixable == current.mixable }.map(\.bits).max()
+    }
+
+    private func dopConditions(rate: Double) -> DoP.Conditions {
+        let device = engine.outputDeviceID
+        return DoP.Conditions(enabled: dopEnabled, bitPerfect: bitPerfect, exclusive: engine.isExclusive && !switchingExclusive,
+                              support: dopDevices[currentOutputUID],
+                              deviceRates: device.map(OutputDevice.availableSampleRates) ?? [],
+                              integerBits: integerBits(at: rate), deviceVolume: deviceVolume)
+    }
+
+    /// この曲を DoP で送るか、PCM に変換して再生するか (送らない理由つき)
+    func dopPlan(for track: Track) -> DoP.Plan {
+        guard let info = dsdInfo(track.url) else { return .convert(reason: nil) }
+        return DoP.plan(for: info, dopConditions(rate: DoP.pcmRate(forDSD: info.sampleRate)))
+    }
+
+    private func wantsDoP(_ track: Track) -> Bool {
+        if case .send = dopPlan(for: track) { return !dopRefused.contains(track.url) }
+        return false
+    }
+
+    /// DSD のファイルを DoP に包んだファイル (なければ作る)
+    private func dopURL(for source: URL) async throws -> URL {
+        if let url = dopFiles[source], FileManager.default.fileExists(atPath: url.path) { return url }
+        if let running = dopConversions[source] { return try await running.value }
+        let task = Task.detached(priority: .userInitiated) { try DoP.convert(source) }
+        dopConversions[source] = task
+        defer { dopConversions[source] = nil }
+        let url = try await task.value
+        dopFiles[source] = url
+        return url
+    }
+
+    /// 今の出力デバイスで DoP を確かめられない理由 (確かめられるなら nil)
+    var dopCheckBlocker: String? {
+        _ = outputRevision
+        guard engine.outputDeviceID != nil else { return "出力デバイスがありません" }
+        let conditions = dopConditions(rate: 176_400)
+        if !conditions.deviceRates.contains(where: { abs($0 - 176_400) < 0.5 }) || (conditions.integerBits ?? 0) < 24 {
+            return "このデバイスは 176.4kHz / 24bit の出力に対応していないので、DoP は使えません"
+        }
+        if !bitPerfect { return "ビットパーフェクト再生をオンにすると、確かめられます" }
+        if !conditions.exclusive { return "排他モードをオンにすると、確かめられます" }
+        return nil
+    }
+
+    /// 今の出力デバイスの確認結果
+    var dopSupport: DoP.Support? {
+        _ = outputRevision
+        return dopDevices[currentOutputUID]
+    }
+
+    /// DoP の対応の確認を始める: 再生を止め、デバイス側の音量を小さくしておく (30 dB 下げる)。
+    /// 対応していない DAC では雑音として鳴るので、最初は小さい音量で鳴らし、聞こえなければ少しずつ上げてもらう
+    func beginDoPCheck() {
+        guard dopCheck == nil, dopCheckBlocker == nil, let device = engine.outputDeviceID else { return }
+        if let id = currentID { dopCheckResume = (id, clock.position) }
+        engine.pause(immediately: true)
+        isPlaying = false
+        updateNowPlayingInfo()
+        let original = deviceVolume
+        if original != nil { OutputDevice.adjustVolume(device, byDB: -30) }
+        dopCheck = DoPCheck(device: currentOutputUID, originalVolume: original)
+        readDeviceVolume()
+    }
+
+    /// 確認用の音を鳴らす (440Hz の「ポー」という音が 4 回)
+    func playDoPCheckTone() {
+        guard var check = dopCheck, !check.playing else { return }
+        check.message = nil
+        check.playing = true
+        dopCheck = check
+        Task {
+            do {
+                let url = try await Task.detached(priority: .userInitiated) { try DoP.testToneURL() }.value
+                let item = PlaybackItem(trackID: dopCheckID, file: try AVAudioFile(forReading: url), source: url, start: 0, end: nil,
+                                        gain: 1, isDoP: true)
+                await engine.prepareOutput(for: item)
+                guard dopCheck != nil else { return }
+                guard engine.dopReady(for: item) else {
+                    dopCheck?.playing = false
+                    dopCheck?.message = "デバイスを 176.4kHz / 24bit に切り替えられませんでした"
+                    return
+                }
+                engine.load(item, play: true)
+                outputRevision += 1
+            } catch {
+                dopCheck?.playing = false
+                dopCheck?.message = "確認用の音を用意できませんでした: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    /// 確認中の音量を少し上げる (6 dB ずつ。確認を始める前の音量までしか上げない)
+    func raiseDoPCheckVolume() {
+        guard let check = dopCheck, let original = check.originalVolume, let device = engine.outputDeviceID else { return }
+        OutputDevice.adjustVolume(device, byDB: 6)
+        if let now = OutputDevice.volume(device), Double(now) > original { OutputDevice.setVolume(device, Float(original)) }
+        readDeviceVolume()
+    }
+
+    /// 確認中に、これ以上音量を上げられるか
+    var canRaiseDoPCheckVolume: Bool {
+        guard let check = dopCheck, check.step == .quiet, let original = check.originalVolume, let now = deviceVolume else { return false }
+        return now < original - 0.001
+    }
+
+    /// 聞こえ方の答えを受け取って、次の段階へ進む
+    func answerDoPCheck(_ answer: DoPCheck.Answer) {
+        guard var check = dopCheck else { return }
+        stopDoPCheckTone()
+        check.playing = false
+        check.message = nil
+        switch (check.step, answer) {
+        case (.quiet, .clean):
+            check.step = .done(.verified)
+        case (.full, .clean):
+            check.step = .done(.verifiedAtFullVolume)
+        case (.quiet, .nothing) where canRaiseDoPCheckVolume || check.originalVolume == nil:
+            check.message = check.originalVolume == nil
+                ? "アンプやヘッドホンの音量を少し上げて、もう一度鳴らしてください"
+                : "「少し大きく」を押してから、もう一度鳴らしてください"
+        case (.quiet, _) where check.originalVolume != nil:
+            // 音量を下げると DoP が通らない DAC かもしれない: 音量を最大にして試すかを尋ねる
+            check.step = .askFull
+        default:
+            check.step = .done(.unsupported)
+        }
+        if case .done(let result) = check.step {
+            dopDevices[check.device] = result
+            restoreDoPCheckVolume(check)
+        }
+        dopCheck = check
+        outputRevision += 1
+    }
+
+    /// DAC の音量を最大にして、もう一度確かめる (アンプ側の音量を絞ってから使ってもらう)
+    func retryDoPCheckAtFullVolume() {
+        guard var check = dopCheck, check.step == .askFull, let device = engine.outputDeviceID else { return }
+        OutputDevice.setVolume(device, 1)
+        readDeviceVolume()
+        check.step = .full
+        dopCheck = check
+    }
+
+    /// 最大にして試すのをやめて、「対応していない」として終える
+    func giveUpDoPCheck() {
+        guard var check = dopCheck else { return }
+        stopDoPCheckTone()
+        check.step = .done(.unsupported)
+        check.playing = false
+        dopDevices[check.device] = .unsupported
+        restoreDoPCheckVolume(check)
+        dopCheck = check
+        outputRevision += 1
+    }
+
+    /// 確認を終える (途中でやめるときも): デバイス側の音量を元に戻し、止めていた曲を同じ位置に読み込み直す
+    func endDoPCheck(resume: Bool = true) {
+        guard let check = dopCheck else { return }
+        stopDoPCheckTone()
+        restoreDoPCheckVolume(check)
+        dopCheck = nil
+        dopRefused.removeAll()
+        outputRevision += 1
+        let point = dopCheckResume
+        dopCheckResume = nil
+        if resume, let point, let track = track(point.id) { play(track, at: point.position, autoplay: false) }
+    }
+
+    /// 開発用の画面の書き出しで、確認の途中の画面を出すためのもの (実際の確認は始めない)
+    func previewDoPCheck(_ check: DoPCheck?) { dopCheck = check }
+
+    /// 確認結果を消して、「未確認」に戻す
+    func forgetDoPSupport() {
+        dopDevices[currentOutputUID] = nil
+        dopRefused.removeAll()
+        engine.invalidateUpcoming()
+        reloadForOutputChange()
+    }
+
+    private func stopDoPCheckTone() {
+        if engine.current?.trackID == dopCheckID { engine.stop() }
+    }
+
+    private func restoreDoPCheckVolume(_ check: DoPCheck) {
+        guard let original = check.originalVolume, let device = engine.outputDeviceID, currentOutputUID == check.device else { return }
+        OutputDevice.setVolume(device, Float(original))
+        readDeviceVolume()
+    }
+
     /// 出力デバイス側の音量を読み直す (デバイスが変わっていれば、見張る先も切り替える)
     private func refreshDeviceVolume() {
         deviceVolumeObserver.observe(engine.outputDeviceID)
@@ -1267,19 +1554,28 @@ final class PlayerModel {
     private func readDeviceVolume() {
         let value = engine.outputDeviceID.flatMap(OutputDevice.volume).map(Double.init)
         if value != deviceVolume { deviceVolume = value }
+        // 音量を下げると DoP が通らない DAC で、DoP の途中に音量が下げられた: 雑音になるので、PCM に変換した再生へ切り替える
+        if dopCheck == nil, dopActive, let t = currentTrack, !wantsDoP(t) { reloadForOutputChange() }
     }
 
-    /// ビットパーフェクト再生中で、音量を Mac から変えられないデバイスを使っているか (音量スライダーを動かせない)
-    var volumeLocked: Bool { bitPerfect && deviceVolume == nil }
+    /// ビットパーフェクト再生中で、音量スライダーを動かせない状態か。
+    /// 音量を Mac から変えられないデバイスを使っているときと、音量を下げると DoP が通らない DAC へ DoP を送っているとき
+    var volumeLocked: Bool {
+        bitPerfect && (deviceVolume == nil || (dopActive && dopDevices[currentOutputUID] == .verifiedAtFullVolume))
+    }
 
     /// ビットパーフェクト再生にしているのに、元のデータのままでは出力できていないときの理由
     var bitPerfectShortfall: String? {
         guard bitPerfect, let path = signalPath else { return nil }
         switch path.quality {
-        case .bitPerfect, .volumeOnly: return nil   // 音量だけ = 消音中
+        case .bitPerfect, .dsdNative, .volumeOnly: return nil   // 音量だけ = 消音中
         case .resampled: return "出力デバイスを曲のサンプルレートに合わせられないため、サンプルレートを変換しています"
         case .reduced: return "出力デバイスを曲のビット深度に合わせられないため、ビット数を減らして出力しています"
-        case .processed: return "この音源は PCM に変換してから再生するため、元のデータのままにはなりません"
+        case .processed:
+            guard let track = currentTrack, case .convert(let reason) = dopPlan(for: track), dsdInfo(track.url) != nil else {
+                return "この音源は PCM に変換してから再生するため、元のデータのままにはなりません"
+            }
+            return "DSD を PCM に変換して再生しています" + (reason.map { "（\($0)）" } ?? "（「DSD・変換」タブで、そのまま送る設定にできます）")
         }
     }
 
@@ -1309,16 +1605,27 @@ final class PlayerModel {
         _ = outputRevision
         guard let t = currentTrack else { return nil }
         let m = t.meta
+        let playing = engine.current?.trackID == t.id ? engine.current : nil
+        let dsd = dsdInfo(t.url)
+        let dop = playing?.isDoP == true
         var parts: [String] = []
-        if let codec = m.codec { parts.append(codec) }
-        if let bits = m.bitDepth, bits > 1 { parts.append("\(bits)bit") }
-        let fileRate = engine.current?.sampleRate ?? m.sampleRate ?? 0
-        if fileRate > 0 { parts.append(Self.sampleRateLabel(fileRate)) }
-        if let br = m.bitrate, m.lossless != true, br > 0 { parts.append("\(br / 1000)kbps") }
+        let fileRate = playing?.sampleRate ?? m.sampleRate ?? 0
+        if let dsd, dop || m.codec == nil {
+            parts = ["DSD", dsd.label, String(format: "%.1fMHz", dsd.sampleRate / 1_000_000)]
+        } else {
+            if let codec = m.codec { parts.append(codec) }
+            if let bits = m.bitDepth, bits > 1 { parts.append("\(bits)bit") }
+            if m.bitDepth == 1, let dsd { parts.append(dsd.label) } else if fileRate > 0 { parts.append(Self.sampleRateLabel(fileRate)) }
+            if let br = m.bitrate, m.lossless != true, br > 0 { parts.append("\(br / 1000)kbps") }
+        }
 
         var stages: [SignalPath.Stage] = []
-        if m.bitDepth == 1 {
-            stages.append(.init(name: "PCM への変換", detail: "DSD → PCM", symbol: "waveform.path"))
+        if dop {
+            stages.append(.init(name: "DoP", detail: "DSD のまま 24bit の PCM に包んで送る（加工なし）", symbol: "shippingbox"))
+        } else if m.bitDepth == 1 || dsd != nil {
+            var detail = "DSD → PCM"
+            if case .convert(let reason?) = dopPlan(for: t) { detail += "（\(reason)）" }
+            stages.append(.init(name: "PCM への変換", detail: detail, symbol: "waveform.path"))
         }
         if let gain = currentGainInfo {
             stages.append(.init(name: "音量の均一化", detail: String(format: "%@ %+.1f dB", gain.source, gain.db), symbol: "speaker.wave.2"))
@@ -1344,16 +1651,20 @@ final class PlayerModel {
         let chainRate = engine.chainSampleRate
         let resampled = fileRate > 0 && abs(fileRate - chainRate) > 0.5
         if resampled {
-            stages.append(.init(name: "サンプルレート変換", detail: "\(Self.sampleRateLabel(fileRate)) → \(Self.sampleRateLabel(chainRate))（最高品質）", symbol: "arrow.triangle.2.circlepath"))
+            // 設定で整数倍に上げているときは「アップサンプリング」、デバイスが合わせられなかったときは「サンプルレート変換」
+            let ratio = chainRate / fileRate
+            let upsampled = engine.upsampling != .off && ratio > 1.5 && abs(ratio - ratio.rounded()) < 1e-6
+            stages.append(.init(name: upsampled ? "アップサンプリング" : "サンプルレート変換",
+                                detail: "\(Self.sampleRateLabel(fileRate)) → \(Self.sampleRateLabel(chainRate))（マスタリング品質）",
+                                symbol: upsampled ? "arrow.up.right.circle" : "arrow.triangle.2.circlepath"))
         }
         let softVolume = muted || (!bitPerfect && appVolume < 0.9995)
         if softVolume {
             stages.append(.init(name: "音量", detail: muted ? "消音" : String(format: "%.1f dB", 40 * log10(max(appVolume, 0.0001))), symbol: "speaker.wave.1"))
         }
         let info = engine.outputInfo
-        // 曲のビット深度を、出力までそのまま運べているか
-        let sourceBits = engine.current?.trackID == t.id ? engine.current?.sourceBits : nil
-        let reduction = SignalPath.depthReduction(source: sourceBits, output: info.format?.precision)
+        // 曲のビット数を、出力までそのまま運べているか (変換したあとの音は、もとのビット数では表せないので見ない)
+        let reduction = resampled || dop ? nil : SignalPath.depthReduction(source: playing?.sourceBits, output: info.format?.precision)
         if let reduction {
             stages.append(.init(name: "ビット深度の変換", detail: reduction, symbol: "arrow.down.right.and.arrow.up.left"))
         }
@@ -1362,9 +1673,10 @@ final class PlayerModel {
         if let transport = info.transport { output += "（\(transport)）" }
         if engine.isExclusive { output += " · 排他" }
 
-        let processed = stages.contains { !["サンプルレート変換", "音量", "ビット深度の変換"].contains($0.name) }
+        let passive = ["サンプルレート変換", "アップサンプリング", "音量", "ビット深度の変換", "DoP"]
+        let processed = stages.contains { !passive.contains($0.name) }
         let quality: SignalPath.Quality = processed ? .processed : resampled ? .resampled
-            : reduction != nil ? .reduced : softVolume ? .volumeOnly : .bitPerfect
+            : reduction != nil ? .reduced : softVolume ? .volumeOnly : dop ? .dsdNative : .bitPerfect
         return SignalPath(source: parts.joined(separator: " · "), stages: stages, output: output, quality: quality)
     }
 
@@ -1402,6 +1714,13 @@ final class PlayerModel {
 
     private func readyNextItem() -> PlaybackItem? {
         guard !sleepAtTrackEnd, let next = nextTrack(after: currentID, auto: true) else { return nil }
+        if wantsDoP(next) {
+            guard let url = dopFiles[next.url], let file = try? AVAudioFile(forReading: url) else {
+                prepareNext()
+                return nil
+            }
+            return PlaybackItem(trackID: next.id, file: file, source: next.url, start: next.start ?? 0, end: next.end, gain: 1, isDoP: true)
+        }
         guard let url = playable[next.url] else {
             prepareNext()
             return nil
@@ -1414,11 +1733,16 @@ final class PlayerModel {
         guard let n = nextTrack(after: currentID, auto: true) else { return }
         // 次の曲の大きさも先に測っておく (そのまま続けて再生するときに間に合うように)
         if needsLoudness(n) { Task { await scanLoudness(n) } }
+        if wantsDoP(n) {
+            if dopFiles[n.url] == nil, dopConversions[n.url] == nil { Task { _ = try? await dopURL(for: n.url) } }
+            return
+        }
         guard playable[n.url] == nil, conversions[n.url] == nil else { return }
         Task { _ = try? await playableURL(for: n.url) }
     }
 
     private func didAdvance(to id: UUID) {
+        guard id != dopCheckID else { return }
         let changed = currentID != id
         if changed, let finished = currentTrack {
             // 最後まで聴いた曲は、次も頭から
@@ -1441,6 +1765,11 @@ final class PlayerModel {
     }
 
     private func didFinish() {
+        if dopCheck != nil {
+            // 確認用の音が鳴り終わった
+            dopCheck?.playing = false
+            return
+        }
         if sleepAtTrackEnd {
             finishSleep()
             if let t = currentTrack { play(t, at: 0, autoplay: false) }
@@ -1456,6 +1785,7 @@ final class PlayerModel {
     }
 
     private func tick(_ position: Double, _ duration: Double) {
+        guard dopCheck == nil else { return }
         // 画面への反映は 10Hz で十分 (SwiftUI の再レイアウトを減らして省電力に)
         let now = CACurrentMediaTime()
         // 省電力表示でも、同期歌詞・字幕を出している間は行の切り替えが遅れないよう、少し細かく更新する
@@ -1486,6 +1816,9 @@ final class PlayerModel {
 
     private func reloadAfterDeviceChange() {
         refreshOutputDevices()
+        dopRefused.removeAll()
+        // 確認の途中でデバイスが変わったら、確認はやめる
+        if let check = dopCheck, check.device != currentOutputUID { endDoPCheck(resume: false) }
         moveBitPerfectVolume(to: engine.outputDeviceID, uid: currentOutputUID)
         applyDeviceProfile()
         outputRevision += 1
@@ -1699,12 +2032,32 @@ final class PlayerModel {
             let url = t.url
             metaInFlight.insert(url)
             Task {
-                let meta = await MetadataReader.read(url)
+                let meta = await DLsiteCatalog.shared.filled(await MetadataReader.read(url), for: url)
                 metaInFlight.remove(url)
                 metaBuffer[url] = meta
                 scheduleMetaFlush()
                 pumpMetadata()
             }
+        }
+    }
+
+    /// 読み込み済みの曲のうち、アーティストなどが空のものを、DLsite の作品情報で埋める (設定が有効なときだけ)
+    func fillFromDLsite() {
+        guard dlsiteInfo else { return }
+        let targets = queue.filter { $0.meta.loaded && DLsiteWork.wants($0.meta) && ArtworkFinder.workCode(for: $0.url) != nil }
+        guard !targets.isEmpty else { return }
+        Task {
+            var updates: [UUID: TrackMeta] = [:]
+            for t in targets {
+                let filled = await DLsiteCatalog.shared.filled(t.meta, for: t.url)
+                if filled != t.meta { updates[t.id] = filled }
+            }
+            guard !updates.isEmpty else { return }
+            var q = queue
+            for i in q.indices { if let filled = updates[q[i].id] { q[i].meta = filled } }
+            preservingNext { queue = q }
+            updateNowPlayingInfo()
+            scheduleSave()
         }
     }
 

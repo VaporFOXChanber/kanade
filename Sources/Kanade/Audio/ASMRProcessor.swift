@@ -108,6 +108,12 @@ struct ASMRSettings {
     var duckTime: Float = 0.006
     /// 値が変わったら、いったん無音にしてから duck へ向けて上げ直す (曲の途中から鳴らし始めるときのフェードイン)
     var duckRestart: UInt32 = 0
+
+    /// アプリの音量 (倍率)。処理の最後に掛ける。1 のときは何も掛けず、音を 1 ビットも変えない。
+    /// (標準のミキサーの音量は、鳴らし始めの数十 ms でなめらかに動くので、その間は元のデータと一致しなくなる)
+    var gain: Float = 1
+    /// 値が変わったら、gain へなめらかに近づけずに、すぐその値にする (音が出ていないときの変更や、DoP の入り切り)
+    var gainSnap: UInt32 = 0
 }
 
 /// スレッド間で、決まった長さのデータを待たせずに渡す (シーケンスロック)。
@@ -376,6 +382,10 @@ struct ASMRKernel {
     private var feedMix: Float = 0
     private var duck: Float = 1
     private var lastRestart: UInt32 = 0
+    private var gain: Float = 1
+    private var gainCoef: Float = 0
+    /// 最初の設定は、なめらかに近づけずにそのまま使う
+    private var lastGainSnap: UInt32 = .max
     /// 今かかっているラウドネス補正量 (dB)。設定値へ少しずつ近づける
     private var loudLow: Float = 0
     private var loudHigh: Float = 0
@@ -527,6 +537,11 @@ struct ASMRKernel {
             lastRestart = s.duckRestart
             duck = 0
         }
+        gainCoef = 1 - exp(-1 / (0.008 * sr))
+        if s.gainSnap != lastGainSnap {
+            lastGainSnap = s.gainSnap
+            gain = s.gain
+        }
         if s.lowCut > 0, s.lowCut != rumbleFrequency {
             rumbleFrequency = s.lowCut
             let t = trig(Double(s.lowCut))
@@ -660,6 +675,7 @@ struct ASMRKernel {
         let limiterOn = s.limiter
         let swap = s.swap
         let duckTarget = s.duck
+        let gainTarget = s.gain
         let softening = s.deEssMax > 0
         let rumbleTarget: Float = s.lowCut > 0 ? 1 : 0
         let feedTarget: Float = s.crossfeedCut > 0 ? 1 : 0
@@ -870,8 +886,13 @@ struct ASMRKernel {
             }
             let q = 0.5 * (ol * ol + or * or)
             outEnv += (q > outEnv ? envAtt : envRel) * (q - outEnv)
-            left[i] = ol
-            right[i] = or
+            // アプリの音量。目標に十分近づいたらその値にそろえる (1 のときは、掛けても値が変わらない)
+            if gain != gainTarget {
+                gain += (gainTarget - gain) * gainCoef
+                if abs(gainTarget - gain) < 1e-5 { gain = gainTarget }
+            }
+            left[i] = ol * gain
+            right[i] = or * gain
         }
         env = max(env, 1e-14)
         envFast = max(envFast, 1e-14)

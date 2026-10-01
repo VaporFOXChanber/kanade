@@ -385,6 +385,65 @@ struct SampleRateTests {
     }
 }
 
+@Suite("音量", .serialized)
+@MainActor
+struct VolumeTests {
+    private func original(_ i: Int) -> Float {
+        Float(Double(OfflineRig.amplitude) * sin(2 * Double.pi * OfflineRig.frequency * Double(i) / OfflineRig.sampleRate))
+    }
+
+    @Test("音量が最大なら、曲の最初のサンプルから 1 ビットも変わらない (鳴らし始めに、音量がなめらかに動く区間がない)")
+    func exactFromTheFirstSample() throws {
+        let rig = try OfflineRig()
+        rig.audio.load(rig.item, play: true)
+        try rig.run(0.2)
+        let latency = ASMRKernel.latencyFrames(sampleRate: 48000)
+        let delay = try #require(((latency - 2)...(latency + 2)).first { d in (0..<200).allSatisfy { rig.left[d + $0] == original($0) } },
+                                 "最初のサンプルから一致する遅れが見つからない")
+        #expect((0..<(9600 - delay)).allSatisfy { rig.left[delay + $0] == original($0) })
+        #expect(rig.left[0..<delay].allSatisfy { $0 == 0 })
+    }
+
+    @Test("止まっている間に決めた音量は、鳴らし始めからその大きさで出る (音量は 2 乗で効く)")
+    func volumeAppliesFromTheStart() throws {
+        let rig = try OfflineRig()
+        rig.audio.volume = 0.5
+        rig.audio.load(rig.item, play: true)
+        try rig.run(0.3)
+        let delay = ASMRKernel.latencyFrames(sampleRate: 48000)
+        // 最初の山から、もう 0.25 倍になっている
+        for i in [12, 36, 60, 600, 6000] { #expect(abs(rig.left[delay + i] - 0.25 * original(i)) < 1e-6, "\(i)") }
+        #expect(abs(rig.level(rig.frames(0.1)..<rig.frames(0.3)) - (-12.04)) < 0.05)
+    }
+
+    @Test("再生中に音量を変えると、段差を作らずになめらかに変わる")
+    func volumeChangesSmoothly() throws {
+        let rig = try OfflineRig()
+        rig.audio.load(rig.item, play: true)
+        try rig.run(0.3)
+        rig.audio.volume = 0.2
+        try rig.run(0.3)
+        #expect(abs(rig.level(rig.frames(0.1)..<rig.frames(0.3))) < 0.05)                       // 変える前
+        #expect(abs(rig.level(rig.frames(0.45)..<rig.frames(0.6)) - (-27.96)) < 0.05)           // 変えたあと (0.2² = -28 dB)
+        #expect(rig.steepest(rig.frames(0.29)..<rig.frames(0.45)) <= rig.steadyStep * 1.05)     // 移り変わりに段差がない
+        // 消音も同じ
+        rig.audio.volume = 0
+        try rig.run(0.2)
+        #expect(rig.left[rig.frames(0.75)..<rig.frames(0.8)].allSatisfy { $0 == 0 })
+        #expect(rig.steepest(rig.frames(0.59)..<rig.frames(0.75)) <= rig.steadyStep * 0.05)
+    }
+
+    @Test("スリープタイマーのフェードも、同じように掛かる")
+    func sleepFade() throws {
+        let rig = try OfflineRig()
+        rig.audio.load(rig.item, play: true)
+        try rig.run(0.2)
+        rig.audio.fadeMultiplier = 0.5
+        try rig.run(0.3)
+        #expect(abs(rig.level(rig.frames(0.35)..<rig.frames(0.5)) - (-6.02)) < 0.05)
+    }
+}
+
 @Suite("左右の確認音")
 struct ChannelCheckTests {
     @Test("左で 1 回、そのあと右で 2 回鳴る")

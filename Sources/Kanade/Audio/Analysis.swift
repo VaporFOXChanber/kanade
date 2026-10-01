@@ -32,6 +32,10 @@ final class SpectrumAnalyzer: @unchecked Sendable {
     private let lock = NSLock()
     /// 省電力表示のときは解析しない (表示するものがないため)
     var enabled = true
+    /// DoP を流している間は解析しない (PCM として見ると雑音にしか見えないため)
+    var suspended = false
+    /// 受け取る音にすでに掛かっている音量 (倍率)。表示は音量に左右されないよう、この分を戻してから解析する
+    var inputGain: Float = 1
 
     init() {
         fft = vDSP_create_fftsetup(11, FFTRadix(kFFTRadix2))!
@@ -42,14 +46,16 @@ final class SpectrumAnalyzer: @unchecked Sendable {
     deinit { vDSP_destroy_fftsetup(fft) }
 
     func process(_ buffer: AVAudioPCMBuffer) {
-        guard enabled, let data = buffer.floatChannelData else { return }
+        guard enabled, !suspended, let data = buffer.floatChannelData else { return }
         let n = Int(buffer.frameLength), channels = Int(buffer.format.channelCount)
         guard n > 0, channels > 0 else { return }
         let rate = buffer.format.sampleRate
 
         var mono = [Float](repeating: 0, count: n)
         for c in 0..<channels { vDSP_vadd(data[c], 1, mono, 1, &mono, 1, vDSP_Length(n)) }
-        var scale = 1 / Float(channels)
+        // 音量を絞りきっているとき (ほぼ無音) は、戻さずにそのまま扱う
+        let restore: Float = inputGain > 0.001 ? 1 / inputGain : 1
+        var scale = restore / Float(channels)
         vDSP_vsmul(mono, 1, &scale, &mono, 1, vDSP_Length(n))
 
         let base = history.count
@@ -69,6 +75,8 @@ final class SpectrumAnalyzer: @unchecked Sendable {
                 if hi > lo {
                     vDSP_rmsqv(data[0] + lo, 1, &frame.left, vDSP_Length(hi - lo))
                     vDSP_rmsqv(data[min(1, channels - 1)] + lo, 1, &frame.right, vDSP_Length(hi - lo))
+                    frame.left *= restore
+                    frame.right *= restore
                 }
                 produced.append(frame)
             }

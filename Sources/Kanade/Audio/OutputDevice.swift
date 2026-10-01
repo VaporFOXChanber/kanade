@@ -304,6 +304,45 @@ enum OutputDevice {
     }
 }
 
+/// アップサンプリング: 曲のサンプルレートの整数倍 (2 倍・4 倍…) にデバイスを切り替え、最高品質で変換してから送る。
+/// DAC の中で行われる変換の代わりに、Mac の側で精度の高い変換を済ませておく
+enum Upsampling: String, CaseIterable, Identifiable {
+    case off, double, quadruple, maximum
+
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .off: "オフ"
+        case .double: "2 倍"
+        case .quadruple: "4 倍"
+        case .maximum: "最大"
+        }
+    }
+
+    /// 上げる倍率の上限
+    private var limit: Double {
+        switch self {
+        case .off: 1
+        case .double: 2
+        case .quadruple: 4
+        case .maximum: .infinity
+        }
+    }
+
+    /// 切り替え先のサンプルレート。曲の 2 倍・4 倍・8 倍…のうち、デバイスが対応していて上限を超えない、いちばん高いもの。
+    /// 上げられない (もうデバイスの上限、または倍のレートに対応していない) なら nil
+    func rate(for fileRate: Double, available: [Double]) -> Double? {
+        guard self != .off, fileRate > 0 else { return nil }
+        var best: Double?
+        var factor = 2.0
+        while factor <= limit, factor <= 64 {
+            if let match = available.first(where: { abs($0 - fileRate * factor) < 0.5 }) { best = match }
+            factor *= 2
+        }
+        return best
+    }
+}
+
 /// 出力デバイス側の音量が変わったことを知らせる (システムの音量を変えたときなど)
 final class DeviceVolumeObserver {
     private var device: AudioDeviceID?

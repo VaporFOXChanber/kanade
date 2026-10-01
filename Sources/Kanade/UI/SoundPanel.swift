@@ -7,9 +7,11 @@ struct SoundPanel: View {
     @AppStorage("soundPanelTab") private var tab = Tab.equalizer
 
     enum Tab: String, CaseIterable, Identifiable {
-        case equalizer, headphone, playback, output
+        case equalizer, headphone, playback, output, advanced
         var id: String { rawValue }
-        var label: String { ["equalizer": "イコライザー", "headphone": "ヘッドホン", "playback": "再生", "output": "出力"][rawValue]! }
+        var label: String {
+            ["equalizer": "イコライザー", "headphone": "ヘッドホン", "playback": "再生", "output": "出力", "advanced": "DSD・変換"][rawValue]!
+        }
     }
 
     var body: some View {
@@ -49,6 +51,7 @@ struct SoundPanel: View {
             case .headphone: HeadphoneTab(tint: tint)
             case .playback: PlaybackTab(tint: tint)
             case .output: OutputTab(tint: tint)
+            case .advanced: AdvancedTab(tint: tint)
             }
         }
         .padding(20)
@@ -506,6 +509,170 @@ private struct OutputTab: View {
     }
 }
 
+// MARK: - DSD・変換 (アップサンプリングと、DSD のネイティブ再生)
+
+private struct AdvancedTab: View {
+    @Environment(PlayerModel.self) private var model
+    let tint: Color
+
+    var body: some View {
+        @Bindable var m = model
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Label("アップサンプリング", systemImage: "arrow.up.right.circle").font(.callout)
+                Spacer()
+                Picker("", selection: $m.upsampling) {
+                    ForEach(Upsampling.allCases) { Text($0.label).tag($0) }
+                }
+                .pickerStyle(.segmented).labelsHidden().frame(width: 240)
+                .accessibilityLabel("アップサンプリング")
+            }
+            .disabled(model.bitPerfect)
+            .opacity(model.bitPerfect ? 0.45 : 1)
+            note("出力デバイスを曲の 2 倍・4 倍…のサンプルレート（44.1kHz の曲なら 88.2 / 176.4 / 352.8kHz）に切り替え、Mac の側で変換してから送ります。変換は 21kHz まで平坦で、折り返しの成分は -170dB 以下です。「最大」は、デバイスが対応しているいちばん高い倍率まで上げます。" + (model.bitPerfect ? "ビットパーフェクト再生中は、元のデータのまま送るので使いません。" : ""))
+
+            Divider().opacity(0.4)
+
+            Toggle(isOn: $m.dopEnabled) {
+                Label("DSD をそのまま送る（DoP）", systemImage: "shippingbox").font(.callout)
+            }
+            note("DSD の曲を PCM に変換せず、DSD のまま DAC へ送ります。送るのは、対応を確かめた DAC で、ビットパーフェクト再生と排他モードがどちらもオンのときだけです。送っている間は、音量・EQ・フェードなどの加工を一切通しません（1 ビットでも変わると雑音になるため）。条件がそろわないときは、これまでどおり PCM に変換して再生します。")
+
+            DoPDeviceSection(tint: tint)
+        }
+    }
+}
+
+/// 今の出力デバイスが DoP に対応しているかの表示と、確かめる手順
+private struct DoPDeviceSection: View {
+    @Environment(PlayerModel.self) private var model
+    let tint: Color
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: statusSymbol).foregroundStyle(statusColor)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(model.engine.outputInfo.name).font(.callout.weight(.semibold))
+                    Text(statusText).font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 0)
+                if model.dopCheck == nil {
+                    if model.dopSupport != nil {
+                        Button("確認結果を消す") { model.forgetDoPSupport() }.controlSize(.small)
+                    }
+                    Button(model.dopSupport == nil ? "確かめる…" : "もう一度確かめる…") { model.beginDoPCheck() }
+                        .controlSize(.small)
+                        .disabled(model.dopCheckBlocker != nil)
+                }
+            }
+            if model.dopCheck == nil, let blocker = model.dopCheckBlocker {
+                note(blocker)
+            }
+            if let check = model.dopCheck {
+                Divider().opacity(0.4)
+                checkPanel(check)
+            }
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 10).fill(.white.opacity(0.05)))
+        .onDisappear { model.endDoPCheck() }
+    }
+
+    private var statusText: String {
+        switch model.dopSupport {
+        case nil: "DoP に対応しているか、まだ確かめていません（確かめるまでは送りません）"
+        case .verified: "DoP に対応していることを確認済み"
+        case .verifiedAtFullVolume: "DoP に対応（DAC の音量が最大のときだけ送ります）"
+        case .unsupported: "DoP に対応していません（PCM に変換して再生します）"
+        }
+    }
+
+    private var statusSymbol: String {
+        switch model.dopSupport {
+        case nil: "questionmark.circle"
+        case .verified, .verifiedAtFullVolume: "checkmark.circle.fill"
+        case .unsupported: "xmark.circle"
+        }
+    }
+
+    private var statusColor: Color {
+        switch model.dopSupport {
+        case .verified, .verifiedAtFullVolume: tint
+        default: .secondary
+        }
+    }
+
+    @ViewBuilder
+    private func checkPanel(_ check: DoPCheck) -> some View {
+        switch check.step {
+        case .quiet, .full:
+            Text(check.step == .quiet ? "小さい音量で、確認用の音を鳴らします" : "DAC の音量を最大にして、確認用の音を鳴らします")
+                .font(.callout.weight(.semibold))
+            note(instruction(check))
+            HStack(spacing: 8) {
+                Button { model.playDoPCheckTone() } label: { Label(check.playing ? "鳴らしています…" : "鳴らす", systemImage: "play.fill") }
+                    .disabled(check.playing)
+                if check.step == .quiet, check.originalVolume != nil {
+                    Button("少し大きく") { model.raiseDoPCheckVolume() }.disabled(!model.canRaiseDoPCheckVolume)
+                }
+                Spacer()
+                Button("やめる") { model.endDoPCheck() }
+            }
+            .controlSize(.small)
+            if let message = check.message {
+                Label(message, systemImage: "info.circle").font(.caption).foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Text("どう聞こえましたか？").font(.caption).foregroundStyle(.secondary)
+            HStack(spacing: 8) {
+                Button("澄んだ「ポー」という音") { model.answerDoPCheck(.clean) }
+                Button("ザーという雑音") { model.answerDoPCheck(.noise) }
+                Button("何も聞こえない") { model.answerDoPCheck(.nothing) }
+            }
+            .controlSize(.small)
+        case .askFull:
+            Text("小さい音量では、DSD として再生されませんでした").font(.callout.weight(.semibold))
+            note("DAC が DoP に対応していないか、音量を下げると DoP が通らなくなる DAC です。後者なら、DAC の音量を最大にすると再生できます。アンプやヘッドホンの側で音量を十分に下げられる場合だけ、音量を下げてから試してください（対応していなければ、最大の音量で雑音が出ます）。")
+            HStack(spacing: 8) {
+                Button("DAC の音量を最大にして試す") { model.retryDoPCheckAtFullVolume() }
+                Button("対応していないとして終える") { model.giveUpDoPCheck() }
+            }
+            .controlSize(.small)
+        case .done(let result):
+            Text(resultTitle(result)).font(.callout.weight(.semibold))
+            note(resultDetail(result))
+            Button("閉じる") { model.endDoPCheck() }.controlSize(.small)
+        }
+    }
+
+    private func instruction(_ check: DoPCheck) -> String {
+        let tone = "「ポー」という音が 4 回鳴ります。対応していない DAC では、ザーという雑音になります。"
+        if check.step == .full {
+            return "アンプやヘッドホンの音量を絞ってから、鳴らしてください。" + tone
+        }
+        return check.originalVolume == nil
+            ? "この DAC の音量は Mac から変えられません。アンプやヘッドホンの音量をいちばん小さくしてから鳴らし、聞こえなければ少しずつ上げてください。" + tone
+            : "DAC の音量を 30dB 下げてあります（終わったら元に戻します）。聞こえなければ「少し大きく」で上げてください。" + tone
+    }
+
+    private func resultTitle(_ result: DoP.Support) -> String {
+        switch result {
+        case .verified: "この DAC は DoP に対応しています"
+        case .verifiedAtFullVolume: "この DAC は、音量が最大のときだけ DoP に対応しています"
+        case .unsupported: "この DAC には DoP を送りません"
+        }
+    }
+
+    private func resultDetail(_ result: DoP.Support) -> String {
+        switch result {
+        case .verified: "ビットパーフェクト再生と排他モードがオンのとき、DSD の曲をそのまま送ります。音量は元に戻しました。"
+        case .verifiedAtFullVolume: "DAC の音量が最大のときだけ、DSD の曲をそのまま送ります。音量はアンプ側で調整してください（DSD を送っている間は、音量スライダーを動かせません）。DAC の音量は、確認前の値に戻しました。"
+        case .unsupported: "DSD の曲は、これまでどおり PCM に変換して再生します。音量は元に戻しました。"
+        }
+    }
+}
+
 /// 音が出力までにたどる道筋
 struct SignalPathView: View {
     @Environment(PlayerModel.self) private var model
@@ -519,9 +686,9 @@ struct SignalPathView: View {
                     Spacer()
                     Text(path.quality.label)
                         .font(.system(size: 11, weight: .bold, design: .rounded))
-                        .foregroundStyle(path.quality == .bitPerfect ? .black.opacity(0.8) : .white.opacity(0.85))
+                        .foregroundStyle(path.quality.isPure ? .black.opacity(0.8) : .white.opacity(0.85))
                         .padding(.horizontal, 9).padding(.vertical, 3.5)
-                        .background(Capsule().fill(path.quality == .bitPerfect ? tint : .white.opacity(0.12)))
+                        .background(Capsule().fill(path.quality.isPure ? tint : .white.opacity(0.12)))
                 }
                 .padding(.bottom, 8)
                 step("doc.badge.gearshape", "音源", path.source, first: true)

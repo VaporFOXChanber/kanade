@@ -37,6 +37,7 @@ struct SettingsView: View {
 
             Section {
                 Toggle("DLsite から作品画像を取得する", isOn: $m.dlsiteArtwork)
+                Toggle("DLsite から声優名とサークル名を取得する", isOn: $m.dlsiteInfo)
                 LabeledContent("取得した画像") {
                     HStack {
                         Text("\(downloadedArtwork) 件").monospacedDigit()
@@ -48,9 +49,9 @@ struct SettingsView: View {
                     }
                 }
             } header: {
-                Text("アートワーク")
+                Text("DLsite の作品")
             } footer: {
-                Text("音源に画像がなく、作品のフォルダにも画像が見つからないとき、フォルダ名やファイル名にある作品番号（RJ01234567 など）で DLsite に問い合わせ、作品画像を保存して使います。オンにすると、その作品番号が DLsite のサーバーに送られます。再生画面に画像をドロップすると、その作品のアートワークを自分で指定できます（こちらは通信しません）。")
+                Text("フォルダ名やファイル名に作品番号（RJ01234567 など）がある曲で、DLsite に問い合わせます。オンにすると、その作品番号が DLsite のサーバーに送られます。\n・作品画像: 音源に画像がなく、作品のフォルダにも見つからないときに、保存して使います。再生画面に画像をドロップすると、アートワークを自分で指定できます（こちらは通信しません）。\n・声優名とサークル名: タグが空のときだけ、アーティストに声優名、アルバムアーティストにサークル名を入れます（タグに書いてある名前は変えません）。ライブラリの「アーティスト」は、サークルごとに並びます。")
                     .font(.caption).foregroundStyle(.secondary)
             }
 

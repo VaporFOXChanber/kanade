@@ -30,6 +30,8 @@ struct SignalPath: Equatable {
     enum Quality: Equatable {
         /// 元のデータを 1 ビットも変えずに出力している
         case bitPerfect
+        /// DSD のデータを、PCM に直さずそのまま DAC へ送っている
+        case dsdNative
         /// 加工はしていないが、アプリの音量を下げている
         case volumeOnly
         /// サンプルレートの変換だけをしている
@@ -39,9 +41,13 @@ struct SignalPath: Equatable {
         /// EQ などの加工をしている
         case processed
 
+        /// 元のデータを変えずに出力できているか
+        var isPure: Bool { self == .bitPerfect || self == .dsdNative }
+
         var label: String {
             switch self {
             case .bitPerfect: "ビットパーフェクト"
+            case .dsdNative: "DSD ネイティブ（DoP）"
             case .volumeOnly: "無加工（音量のみ調整）"
             case .resampled: "サンプルレートを変換"
             case .reduced: "ビット深度を変換"
@@ -64,6 +70,36 @@ struct SignalPath: Equatable {
         guard source > carried else { return nil }
         return carried < 24 ? "\(source)bit → \(carried)bit（デバイスの形式）" : "\(source)bit → 24bit 相当（32bit 浮動小数点で処理）"
     }
+}
+
+/// DAC が DoP に対応しているかを、実際に音を聴いて確かめている途中の状態
+struct DoPCheck: Equatable {
+    enum Step: Equatable {
+        /// 小さい音量で鳴らして、聞こえ方を尋ねている
+        case quiet
+        /// 小さい音量ではきれいに鳴らなかった: DAC の音量を最大にして試すかを尋ねている
+        case askFull
+        /// DAC の音量を最大にして鳴らし、聞こえ方を尋ねている
+        case full
+        case done(DoP.Support)
+    }
+
+    enum Answer {
+        /// 澄んだ音が聞こえた
+        case clean
+        /// ザーという雑音が聞こえた (雑音まじりの音も含む)
+        case noise
+        /// 何も聞こえなかった
+        case nothing
+    }
+
+    /// 確かめているデバイスの UID
+    var device: String
+    /// 確認を始める前の、デバイス側の音量 (Mac から変えられないデバイスなら nil)。終わったら戻す
+    var originalVolume: Double?
+    var step = Step.quiet
+    var playing = false
+    var message: String?
 }
 
 /// ビットパーフェクト再生の間、アプリの音量の代わりに出力デバイス側で下げている音量 (デバイスごと)。

@@ -10,6 +10,8 @@ struct PlaybackItem {
     let end: Double?
     /// ReplayGain などのトラック別ゲイン (リニア)
     let gain: Float
+    /// DoP (DSD のビットを PCM の形に包んだもの) のファイルか。1 ビットでも変えると雑音になるので、一切の加工を通さない
+    var isDoP = false
 
     var sampleRate: Double { file.processingFormat.sampleRate }
     /// 元のデータのビット深度 (整数の PCM とロスレス圧縮だけ。MP3 などの圧縮音源や浮動小数点の音源は nil)
@@ -44,8 +46,25 @@ final class Deck {
     }
 
     let player = AVAudioPlayerNode()
+    /// サンプルレートの変換 (曲と経路のサンプルレートが違うときだけ、プレイヤーとミキサーの間に入れる)。
+    /// ミキサーに任せると 20kHz で約 8dB 落ちるので、Apple の変換ユニットを「マスタリング」の品質で使う
+    /// (21kHz まで平坦で、折り返しの成分は -170dB 以下)
+    let converter: AVAudioUnitTimeEffect = {
+        let unit = AVAudioUnitTimeEffect(audioComponentDescription: AudioComponentDescription(
+            componentType: kAudioUnitType_FormatConverter, componentSubType: kAudioUnitSubType_AUConverter,
+            componentManufacturer: kAudioUnitManufacturer_Apple, componentFlags: 0, componentFlagsMask: 0))
+        var complexity = kAudioUnitSampleRateConverterComplexity_Mastering
+        AudioUnitSetProperty(unit.audioUnit, kAudioUnitProperty_SampleRateConverterComplexity, kAudioUnitScope_Global, 0,
+                             &complexity, UInt32(MemoryLayout<UInt32>.size))
+        var quality = UInt32(kRenderQuality_Max)
+        AudioUnitSetProperty(unit.audioUnit, kAudioUnitProperty_RenderQuality, kAudioUnitScope_Global, 0,
+                             &quality, UInt32(MemoryLayout<UInt32>.size))
+        return unit
+    }()
     let bus: AVAudioNodeBus
     var format: AVAudioFormat?
+    /// 今のつなぎ方で、変換ユニットを通しているか。通している場合の、変換後のサンプルレート
+    var convertedRate: Double?
     private(set) var segments: [Segment] = []
     private(set) var generation = 0
     private var lastSampleTime: AVAudioFramePosition = 0
@@ -63,6 +82,8 @@ final class Deck {
     func stop() {
         generation += 1
         player.stop()
+        // 変換ユニットに残っている前の音を捨てる
+        if convertedRate != nil { converter.reset() }
         segments.removeAll()
         lastSampleTime = 0
     }
@@ -74,7 +95,7 @@ final class Deck {
         let count = max(1, item.endFrame - startFrame)
         let seg = Segment(item: item, startFrame: startFrame, frameCount: count, offset: scheduledEnd)
         segments.append(seg)
-        if segments.count == 1 { gain = item.gain }
+        if segments.count == 1 { gain = item.isDoP ? 1 : item.gain }
         let gen = generation
         player.scheduleSegment(item.file, startingFrame: startFrame, frameCount: AVAudioFrameCount(count), at: nil,
                                completionCallbackType: .dataPlayedBack) { [weak self] _ in
@@ -154,7 +175,13 @@ final class AudioEngine {
     private var reportedSegment = -1
     private var timer: Timer?
 
-    private(set) var current: PlaybackItem?
+    private(set) var current: PlaybackItem? {
+        didSet { if (oldValue?.isDoP ?? false) != raw { applyRaw() } }
+    }
+    /// DoP を流している間か。この間は、音量・フェード・EQ・左右バランスなど、音を 1 ビットでも変えるものをすべて外す
+    private var raw: Bool { current?.isDoP == true }
+    /// EQ を通さない設定になっているか (DoP の間は、設定にかかわらず通さない)
+    private var eqBypassWanted = true
     private(set) var isPlaying = false
 
     // 設定
@@ -162,7 +189,7 @@ final class AudioEngine {
     var loop: ClosedRange<Double>?
     var volume: Float = 0.8 { didSet { applyVolume() } }
     var fadeMultiplier: Float = 1 { didSet { applyVolume() } }
-    var balance: Float = 0 { didSet { decks.forEach { $0.player.pan = balance } } }
+    var balance: Float = 0 { didSet { decks.forEach { $0.player.pan = raw ? 0 : balance } } }
     var rate: Float = 1 { didSet { applyRate() } }
     var pitch: Float = 0 { didSet { applyRate() } }
     var preservePitch = true { didSet { applyRate() } }
@@ -184,6 +211,8 @@ final class AudioEngine {
     private var selectedDevice: AudioDeviceID?
     /// デバイスのサンプルレートとビット深度を曲に合わせて切り替える (合えば、サンプルレートの変換もビットの切り捨ても入らない)
     var matchSampleRate = false
+    /// 曲より高いサンプルレート (整数倍) にデバイスを切り替えて、変換してから送る
+    var upsampling = Upsampling.off
     /// 出力デバイスを排他的に使う (ほかのアプリの音が混ざらない)
     /// (切り替えは setExclusiveMode で行う)
     private(set) var exclusiveMode = false
@@ -248,6 +277,7 @@ final class AudioEngine {
         let placeholder = AVAudioFormat(standardFormatWithSampleRate: 44100, channels: 2)!
         for deck in decks {
             engine.attach(deck.player)
+            engine.attach(deck.converter)
             engine.connect(deck.player, to: sum, fromBus: 0, toBus: deck.bus, format: placeholder)
             deck.format = placeholder
             deck.onSegmentPlayed = { [weak self] d, gen, seg in self?.segmentPlayed(d, seg) }
@@ -256,8 +286,7 @@ final class AudioEngine {
             ? engine.outputNode.outputFormat(forBus: 0).sampleRate : 48000, channels: 2)!
         chainSampleRate = chain.sampleRate
         connectChain(chain)
-        // サンプルレートの違う曲を変換するときの品質を最高にする
-        // (標準のままだと、変換の誤差が約 40dB 大きく、高域も早く落ち始める)
+        // ミキサーの中での変換も、品質を最高にしておく (サンプルレートの変換は、ふだんはデッキごとの変換ユニットが行う)
         sum.auAudioUnit.renderQuality = 127
         engine.mainMixerNode.auAudioUnit.renderQuality = 127
         engine.attach(checker)
@@ -271,10 +300,10 @@ final class AudioEngine {
             band.bypass = false
         }
         eq.bypass = true
+        // 標準のミキサーの音量は 1 のまま動かさない (動かすと、なめらかに変化する間は元のデータと一致しなくなる)
+        engine.mainMixerNode.outputVolume = 1
         applyRate()
         applyVolume()
-
-        publishASMR()
         installTap()
 
         if !offline { observeDefaultOutput() }
@@ -376,13 +405,17 @@ final class AudioEngine {
     /// サンプルレートは、同じ値があればそれ、なければ整数倍。
     /// ビット深度は、今の形式では曲のデータを運びきれないときだけ上げる (16bit のデバイスに 24bit の曲など)
     private func deviceSwitch(for item: PlaybackItem) -> (device: AudioDeviceID, rate: Double?, format: OutputDevice.PhysicalFormat?)? {
-        guard matchSampleRate, let device = currentDevice, let now = OutputDevice.nominalSampleRate(device) else { return nil }
+        // DoP は、変換すると雑音になるので、アップサンプリングの対象にしない
+        let upsampling = item.isDoP ? .off : upsampling
+        guard matchSampleRate || upsampling != .off, let device = currentDevice,
+              let now = OutputDevice.nominalSampleRate(device) else { return nil }
         var rate = now
-        if let best = OutputDevice.bestRate(for: item.sampleRate, available: OutputDevice.availableSampleRates(device)),
+        let available = OutputDevice.availableSampleRates(device)
+        if let best = upsampling.rate(for: item.sampleRate, available: available) ?? OutputDevice.bestRate(for: item.sampleRate, available: available),
            !wasJustReverted(from: best) { rate = best }
         var format: OutputDevice.PhysicalFormat?
-        // ビット深度の決まっていない音源 (MP3 など) は、24bit あれば足りる
-        let needed = item.sourceBits ?? 24
+        // ビット深度の決まっていない音源 (MP3 など) は、24bit あれば足りる。変換したあとの音も、16bit には収まらない
+        let needed = rate > item.sampleRate + 0.5 ? 24 : item.sourceBits ?? 24
         // (足りているときは、デバイスが受け付ける形式の一覧までは読まない。曲の終わりぎわに繰り返し呼ばれるため)
         if let current = OutputDevice.physicalFormat(device), current.precision < min(needed, 24) {
             format = OutputDevice.betterFormat(needed: needed, current: current,
@@ -487,7 +520,10 @@ final class AudioEngine {
     }
 
     /// 次の曲へそのまま続けて進めるか (デバイスの形式を合わせる設定で、デバイスの切り替えが要るなら進めない)
-    private func canContinue(to next: PlaybackItem) -> Bool { deviceSwitch(for: next) == nil }
+    /// DoP の曲とそうでない曲の間は、出力の状態を確かめ直すので、いったん読み込み直してもらう
+    private func canContinue(to next: PlaybackItem) -> Bool {
+        next.isDoP == raw && deviceSwitch(for: next) == nil
+    }
 
     /// 排他モードを取る / 手放す。うまくいったかを返す。
     ///
@@ -611,6 +647,15 @@ final class AudioEngine {
         cancelCrossfade()
         decks.forEach { $0.stop() }
         upcoming = nil
+        if item.isDoP, !dopReady(for: item) {
+            // そのまま送れない状態で流すと雑音になるので、再生しない (呼ぶ側が、先に dopReady を確かめること)
+            NSLog("Kanade: DoP を送れる状態ではないため、再生を取りやめました")
+            current = nil
+            isPlaying = false
+            stopTimer()
+            onStartFailure?()
+            return
+        }
         let deck = activeDeck
         connect(deck, format: item.file.processingFormat)
         deck.fade = 1
@@ -641,7 +686,7 @@ final class AudioEngine {
             return
         }
         // 絞ってある状態 (フェードして止めたあと) や曲の途中からは、無音から上げ直す
-        let fadeIn = fadeInFromSilence || duck < 1
+        let fadeIn = (fadeInFromSilence || duck < 1) && !raw
         if fadeIn { setDuck(0, time: 0.006, restart: true) }
         startEngine()
         if var xf = crossfade, let paused = xf.pausedAt {
@@ -671,7 +716,7 @@ final class AudioEngine {
         stopTimer()
         // 次に再生するときにフェードインできるよう、止めるときは絞った状態にしておく
         if softTransitions { setDuck(0, time: 0.03) }
-        if softTransitions, !immediately, engine.isRunning {
+        if softTransitions, !raw, !immediately, engine.isRunning {
             // 音を絞りきってから止める (波形の途中で切るとプツッと鳴る)
             pauseGeneration += 1
             let generation = pauseGeneration
@@ -718,7 +763,7 @@ final class AudioEngine {
 
     func seek(to seconds: Double) {
         guard let item = current else { return }
-        guard softTransitions, isPlaying, engine.isRunning else {
+        guard softTransitions, !raw, isPlaying, engine.isRunning else {
             pendingSeek = nil
             performSeek(to: seconds)
             return
@@ -770,7 +815,34 @@ final class AudioEngine {
         for (i, g) in bands.prefix(eq.bands.count).enumerated() { eq.bands[i].gain = g }
         eq.globalGain = preamp
         // すべて 0dB のときは通さない (通すだけでも計算の丸めが入り、元の音と 1 ビット単位では一致しなくなる)
-        eq.bypass = !enabled || (preamp == 0 && bands.allSatisfy { $0 == 0 })
+        eqBypassWanted = !enabled || (preamp == 0 && bands.allSatisfy { $0 == 0 })
+        eq.bypass = raw || eqBypassWanted
+    }
+
+    /// DoP を流し始める / 終えるときに、加工の入り切りをまとめて切り替える
+    private func applyRaw() {
+        if raw {
+            // 絞ってあったら、すぐに元へ戻す (ゆっくり戻すと、その間のデータが変わってしまう)
+            duckGeneration += 1
+            duck = 1
+            duckTime = 0.0005
+        }
+        eq.bypass = raw || eqBypassWanted
+        decks.forEach { $0.player.pan = raw ? 0 : balance }
+        spectrum.suspended = raw
+        applyVolume()
+        publishASMR()
+        publishEQ()
+    }
+
+    /// この DoP のファイルを、今の出力へそのまま送れる状態か。
+    /// 経路がファイルと同じサンプルレートで、速度の変更が入っておらず、排他モードで 24bit 以上の整数の形式になっていること
+    func dopReady(for item: PlaybackItem) -> Bool {
+        guard item.isDoP, !timePitchInChain, !varispeedInChain, abs(chainSampleRate - item.sampleRate) < 0.5 else { return false }
+        if offline { return true }
+        guard isExclusive, let device = currentDevice, let format = OutputDevice.physicalFormat(device) else { return false }
+        return !format.isFloat && format.bits >= 24 && abs(format.rate - item.sampleRate) < 0.5
+            && abs((OutputDevice.nominalSampleRate(device) ?? 0) - item.sampleRate) < 0.5
     }
 
     func setOutputDevice(_ id: AudioDeviceID?) {
@@ -790,12 +862,14 @@ final class AudioEngine {
     // MARK: - 内部
 
     private func publishEQ() {
-        asmrShared.publishEQ(eqProfile.map { EQDesign.stages(for: $0, sampleRate: chainSampleRate) } ?? [])
+        asmrShared.publishEQ(raw ? [] : eqProfile.map { EQDesign.stages(for: $0, sampleRate: chainSampleRate) } ?? [])
     }
 
     private func publishASMR() {
-        var s = asmrSettings
-        s.duck = duck
+        var s = raw ? ASMRSettings() : asmrSettings
+        s.gain = outputGain
+        s.gainSnap = gainSnap
+        s.duck = raw ? 1 : duck
         s.duckTime = duckTime
         s.duckRestart = duckRestart
         asmrShared.publish(s)
@@ -803,6 +877,7 @@ final class AudioEngine {
 
     /// 音を絞る / 戻す。restart を付けると、いったん無音にしてから target へ向かう
     private func setDuck(_ target: Float, time: Float, restart: Bool = false) {
+        guard !raw else { return }
         duckGeneration += 1
         duck = target
         duckTime = time
@@ -824,7 +899,8 @@ final class AudioEngine {
 
     /// 左で 1 回、右で 2 回、小さな音を鳴らす
     func playChannelCheck() {
-        guard let buffer = ChannelCheck.makeBuffer() else { return }
+        // DoP の間は、ほかの音を混ぜられない
+        guard !raw, let buffer = ChannelCheck.makeBuffer(gain: outputGain) else { return }
         checkGeneration += 1
         let generation = checkGeneration
         checker.stop()
@@ -852,8 +928,16 @@ final class AudioEngine {
         }
     }
 
+    /// 出力に掛ける音量 (倍率)。DoP の間は、音量もスリープタイマーのフェードも掛けない (消音だけは、出力を 0 にして行う)
+    private var outputGain: Float { raw ? (volume > 0 ? 1 : 0) : max(0, volume * volume * fadeMultiplier) }
+    private var gainSnap: UInt32 = 0
+
+    /// 音量は、最後段の処理ユニットの中で掛ける (標準のミキサーの音量は使わない)。
+    /// 音が出ていないときと DoP の間は、なめらかに近づけずにすぐ切り替える
     private func applyVolume() {
-        engine.mainMixerNode.outputVolume = max(0, volume * volume * fadeMultiplier)
+        if raw || !isPlaying || !engine.isRunning { gainSnap &+= 1 }
+        spectrum.inputGain = raw ? 1 : outputGain
+        publishASMR()
     }
 
     private func applyRate() {
@@ -880,12 +964,28 @@ final class AudioEngine {
         if let item { load(item, at: position, play: playing) }
     }
 
+    /// デッキを、曲の形式でつなぐ。曲と経路のサンプルレートが違うときは、間に変換ユニットを入れる
+    /// (同じときは入れず、元のデータが 1 ビットも変わらないようにする)
     private func connect(_ deck: Deck, format: AVAudioFormat) {
-        if let f = deck.format, f.sampleRate == format.sampleRate, f.channelCount == format.channelCount { return }
+        var converted: AVAudioFormat?
+        if abs(format.sampleRate - chainSampleRate) > 0.5 {
+            var description = format.streamDescription.pointee
+            description.mSampleRate = chainSampleRate
+            converted = AVAudioFormat(streamDescription: &description, channelLayout: format.channelLayout)
+        }
+        if let f = deck.format, f.sampleRate == format.sampleRate, f.channelCount == format.channelCount,
+           deck.convertedRate == converted?.sampleRate { return }
         engine.disconnectNodeOutput(deck.player)
-        engine.connect(deck.player, to: sum, fromBus: 0, toBus: deck.bus, format: format)
-        deck.player.pan = balance
+        engine.disconnectNodeOutput(deck.converter)
+        if let converted {
+            engine.connect(deck.player, to: deck.converter, format: format)
+            engine.connect(deck.converter, to: sum, fromBus: 0, toBus: deck.bus, format: converted)
+        } else {
+            engine.connect(deck.player, to: sum, fromBus: 0, toBus: deck.bus, format: format)
+        }
+        deck.player.pan = raw ? 0 : balance
         deck.format = format
+        deck.convertedRate = converted?.sampleRate
     }
 
     private func canChain(_ deck: Deck, _ item: PlaybackItem) -> Bool {
@@ -919,7 +1019,7 @@ final class AudioEngine {
         if index != reportedSegment {
             reportedSegment = index
             current = seg.item
-            deck.gain = seg.item.gain
+            deck.gain = seg.item.isDoP ? 1 : seg.item.gain
             if case .chained = upcoming { upcoming = nil }
             onAdvance?(seg.item.trackID)
         }
@@ -927,6 +1027,10 @@ final class AudioEngine {
         onTick?(pos, duration)
         guard isPlaying else { return }
 
+        if raw, let loop, loop.upperBound > loop.lowerBound, pos >= loop.upperBound - 0.03 {
+            performSeek(to: loop.lowerBound)
+            return
+        }
         if let loop, loop.upperBound > loop.lowerBound, pos >= loop.upperBound - 0.03, !loopJumping {
             // つなぎ目でプツッと鳴らないよう、一瞬絞ってから戻る
             loopJumping = true
@@ -946,7 +1050,7 @@ final class AudioEngine {
         let isLast = index == deck.segments.count - 1
         if isLast, upcoming == nil, crossfade == nil, remaining < max(3, crossfadeDuration + 1.5),
            let next = provideNext?(), canContinue(to: next) {
-            let xf = crossfadeDuration > 0.05 && !next.continues(seg.item)
+            let xf = crossfadeDuration > 0.05 && !next.isDoP && !seg.item.isDoP && !next.continues(seg.item)
                 && duration > crossfadeDuration * 2 && next.duration > crossfadeDuration * 2
             if xf {
                 upcoming = .crossfade(next)

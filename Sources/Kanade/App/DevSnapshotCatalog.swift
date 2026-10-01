@@ -7,7 +7,7 @@ enum DevSnapshotCatalog {
         func tab(_ key: String, _ value: String) -> () -> Void { { UserDefaults.standard.set(value, forKey: key) } }
         var shots: [DevSnapshotShot] = []
         // 音響パネル
-        for name in ["equalizer", "headphone", "playback", "output"] {
+        for name in ["equalizer", "headphone", "playback", "output", "advanced"] {
             shots.append(DevSnapshotShot(name: "sound-\(name)", prepare: {
                 tab("soundPanelTab", name)()
                 if name == "headphone", model.eqProfiles.isEmpty {
@@ -20,6 +20,19 @@ enum DevSnapshotCatalog {
                 }
             }, view: { AnyView(SoundPanel()) }))
         }
+        // DoP の対応を確かめている途中の画面 (実際の確認は始めず、表示だけ)
+        let steps: [(String, DoPCheck)] = [
+            ("quiet", DoPCheck(device: "preview", originalVolume: 0.7, message: "「少し大きく」を押してから、もう一度鳴らしてください")),
+            ("ask-full", DoPCheck(device: "preview", originalVolume: 0.7, step: .askFull)),
+            ("done", DoPCheck(device: "preview", originalVolume: 0.7, step: .done(.verified))),
+        ]
+        for (name, check) in steps {
+            shots.append(DevSnapshotShot(name: "dop-check-\(name)", prepare: {
+                tab("soundPanelTab", "advanced")()
+                model.previewDoPCheck(check)
+            }, view: { AnyView(SoundPanel()) }))
+        }
+        shots.append(DevSnapshotShot(name: "dop-check-end", prepare: { model.previewDoPCheck(nil) }, view: { nil }))
         // ビットパーフェクト再生中の音響パネル (次の ASMR パネルで ASMR モードにすると、自動で解除される)
         for name in ["output", "playback"] {
             shots.append(DevSnapshotShot(name: "sound-\(name)-bitperfect", settle: 1500, prepare: {

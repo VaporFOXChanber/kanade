@@ -114,7 +114,7 @@ final class LibraryStore {
         await withTaskGroup(of: (URL, TrackMeta).self) { group in
             func addNext() {
                 guard let url = next.next() else { return }
-                group.addTask { (url, await MetadataReader.read(url)) }
+                group.addTask { (url, await DLsiteCatalog.shared.filled(await MetadataReader.read(url), for: url)) }
             }
             for _ in 0..<4 { addNext() }
             for await (url, meta) in group {
@@ -149,6 +149,25 @@ final class LibraryStore {
         data.tracks = tracks
         rebuildIndex()
         save()
+    }
+
+    /// 読み込み済みの曲のうち、アーティストなどが空のものを、DLsite の作品情報で埋める (設定が有効なときだけ)
+    func fillFromDLsite() {
+        let targets = data.tracks.filter { $0.meta.loaded && DLsiteWork.wants($0.meta) && ArtworkFinder.workCode(for: $0.url) != nil }
+        guard DLsiteCatalog.enabled, !targets.isEmpty else { return }
+        Task {
+            var updates: [UUID: TrackMeta] = [:]
+            for t in targets {
+                let filled = await DLsiteCatalog.shared.filled(t.meta, for: t.url)
+                if filled != t.meta { updates[t.id] = filled }
+            }
+            guard !updates.isEmpty else { return }
+            var tracks = data.tracks
+            for i in tracks.indices { if let filled = updates[tracks[i].id] { tracks[i].meta = filled } }
+            data.tracks = tracks
+            rebuildIndex()
+            save()
+        }
     }
 
     // MARK: プレイリスト
