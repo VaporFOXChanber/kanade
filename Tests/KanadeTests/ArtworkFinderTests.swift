@@ -144,6 +144,63 @@ struct ArtworkFinderTests {
     }
 }
 
+@Suite("正方形でないアートワーク")
+struct SquaredArtworkTests {
+    /// 左半分が赤、右半分が青の画像
+    private func twoColors(width: Int, height: Int) throws -> CGImage {
+        let context = try #require(CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+                                             space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        context.setFillColor(CGColor(srgbRed: 1, green: 0, blue: 0, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: width / 2, height: height))
+        context.setFillColor(CGColor(srgbRed: 0, green: 0, blue: 1, alpha: 1))
+        context.fill(CGRect(x: width / 2, y: 0, width: width - width / 2, height: height))
+        return try #require(context.makeImage())
+    }
+
+    /// (x, y) の色。y は上から
+    private func pixel(_ image: CGImage, _ x: Int, _ y: Int) throws -> (r: Int, g: Int, b: Int, a: Int) {
+        var bytes = [UInt8](repeating: 0, count: 4)
+        let context = try #require(CGContext(data: &bytes, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4,
+                                             space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        context.draw(image, in: CGRect(x: -x, y: -(image.height - 1 - y), width: image.width, height: image.height))
+        return (Int(bytes[0]), Int(bytes[1]), Int(bytes[2]), Int(bytes[3]))
+    }
+
+    @Test("横長の画像: 全体を中央に収め、上下の余白はぼかした同じ画像で埋める")
+    func landscape() throws {
+        let squared = ArtworkStore.squared(try twoColors(width: 400, height: 300))
+        #expect(squared.width == 400 && squared.height == 400)
+        // 中央の帯は元の画像のまま
+        let left = try pixel(squared, 100, 200), right = try pixel(squared, 300, 200)
+        #expect(left.r > 250 && left.b < 5)
+        #expect(right.b > 250 && right.r < 5)
+        // 上下の余白は透明ではなく、元の画像に近い色 (少し暗い) で埋まっている
+        let top = try pixel(squared, 60, 20), bottom = try pixel(squared, 340, 380)
+        #expect(top.a == 255 && bottom.a == 255)
+        #expect(top.r > 120 && top.r < 230 && top.b < 60, "上の余白 \(top)")
+        #expect(bottom.b > 120 && bottom.b < 230 && bottom.r < 60, "下の余白 \(bottom)")
+    }
+
+    @Test("縦長の画像: 左右の余白を埋める")
+    func portrait() throws {
+        let squared = ArtworkStore.squared(try twoColors(width: 200, height: 400))
+        #expect(squared.width == 400 && squared.height == 400)
+        let inside = try pixel(squared, 150, 200)
+        #expect(inside.r > 250)                       // 元の画像の左半分 (赤) は x = 100〜200
+        let margin = try pixel(squared, 30, 200)
+        #expect(margin.a == 255 && margin.r > 100 && margin.r < 230)
+    }
+
+    @Test("正方形や、ほぼ正方形の画像は変えない")
+    func squareIsUntouched() throws {
+        #expect(ArtworkStore.squared(try twoColors(width: 300, height: 300)).width == 300)
+        let nearly = ArtworkStore.squared(try twoColors(width: 600, height: 590))
+        #expect(nearly.width == 600 && nearly.height == 590)
+    }
+}
+
 @Suite("DLsite の作品画像")
 struct DLsiteArtworkTests {
     @Test("作品情報から画像の URL を取り出す")

@@ -114,6 +114,64 @@ final class PlayerModel {
     var eqPreamp = Float(Defaults.double("eqPreamp", 0)) { didSet { Defaults.set("eqPreamp", Double(eqPreamp)); applyEQ() } }
     var eqPresetName = Defaults.string("eqPreset") ?? "フラット" { didSet { Defaults.set("eqPreset", eqPresetName) } }
 
+    // MARK: 高音質のための設定
+    /// ヘッドホン用のクロスフィード
+    var crossfeed = CrossfeedLevel(rawValue: Defaults.string("crossfeed") ?? "") ?? .off {
+        didSet { Defaults.set("crossfeed", crossfeed.rawValue); applyASMR() }
+    }
+    /// EQ などで音が大きくなったときに、0 dBFS を超えて歪まないようにする (加工していないときは働かない)
+    var clipGuard = Defaults.bool("clipGuard", true) { didSet { Defaults.set("clipGuard", clipGuard); applyASMR() } }
+    /// パラメトリック EQ (ヘッドホンの補正など) の設定の一覧と、使っているもの
+    private(set) var eqProfiles: [EQProfile] = Defaults.codable("eqProfiles") ?? [] {
+        didSet { Defaults.setCodable("eqProfiles", eqProfiles); applyASMR() }
+    }
+    var activeProfileID: UUID? = Defaults.string("activeProfile").flatMap(UUID.init) {
+        didSet {
+            Defaults.set("activeProfile", activeProfileID?.uuidString)
+            // 出力デバイスごとに、選んだ設定を覚える
+            var map = deviceProfiles
+            map[currentOutputUID] = activeProfileID?.uuidString ?? ""
+            deviceProfiles = map
+            applyASMR()
+        }
+    }
+    private var deviceProfiles: [String: String] = Defaults.codable("deviceProfiles") ?? [:] {
+        didSet { Defaults.setCodable("deviceProfiles", deviceProfiles) }
+    }
+    /// 出力デバイスのサンプルレートを曲に合わせて切り替える
+    var matchSampleRate = Defaults.bool("matchSampleRate", false) {
+        didSet {
+            Defaults.set("matchSampleRate", matchSampleRate)
+            engine.matchSampleRate = matchSampleRate
+            if !matchSampleRate { engine.restoreOutputDevice() }
+            reloadForOutputChange()
+        }
+    }
+    /// 出力デバイスを排他的に使う
+    var exclusiveMode = Defaults.bool("exclusiveMode", false) {
+        didSet {
+            Defaults.set("exclusiveMode", exclusiveMode)
+            if exclusiveMode != oldValue { applyExclusiveMode() }
+        }
+    }
+    /// 排他モードを切り替えている途中か (設定のスイッチを押せなくする)
+    private(set) var switchingExclusive = false
+    /// 音量をそろえるためのタグ (ReplayGain) がない曲は、大きさを測ってそろえる
+    var loudnessScan = Defaults.bool("loudnessScan", false) {
+        didSet { Defaults.set("loudnessScan", loudnessScan); if loudnessScan { prepareNext() } }
+    }
+    private var loudness = LoudnessStore()
+    private var loudnessInFlight: [String: Task<LoudnessResult?, Never>] = [:]
+    /// 表示を作り直すための番号 (出力デバイスの状態が変わったときに進める)
+    private(set) var outputRevision = 0
+
+    // MARK: 再生回数・お気に入り
+    private(set) var stats = PlayStats()
+    /// 今の曲を聴いた時間 (秒) と、1 回の再生として数えたか
+    private var listened = 0.0
+    private var counted = false
+    private var lastListenTick: CFTimeInterval = 0
+
     // MARK: ASMR モード
     /// 小さい音を持ち上げ大きい音を抑え、急な大音量を止める。EQ・バランス・速度・キーは無効にしてステレオのまま再生する
     var asmrMode = Defaults.bool("asmrMode", false) {
@@ -131,6 +189,14 @@ final class PlayerModel {
     var asmrStrength = ASMRStrength(rawValue: Defaults.string("asmrStrength") ?? "") ?? .standard {
         didSet { Defaults.set("asmrStrength", asmrStrength.rawValue); applyASMR() }
     }
+    /// 「カスタム」の強さの値
+    var asmrCustom: ASMRCustomCurve = Defaults.codable("asmrCustom") ?? ASMRCustomCurve() {
+        didSet { Defaults.setCodable("asmrCustom", asmrCustom); applyASMR() }
+    }
+    /// 低い雑音を切る周波数 (Hz、0 ならオフ)
+    var asmrLowCut = Defaults.double("asmrLowCut", 0) { didSet { Defaults.set("asmrLowCut", asmrLowCut); applyASMR() } }
+    /// 処理前の音と聴き比べている間 (ボタンを押している間だけ true)
+    var asmrCompare = false { didSet { if asmrCompare != oldValue { applyASMR() } } }
     /// 高音の刺さりをやわらげる
     var asmrSoftening = ASMRSoftening(rawValue: Defaults.string("asmrSoftening") ?? "") ?? .off {
         didSet { Defaults.set("asmrSoftening", asmrSoftening.rawValue); applyASMR() }
@@ -213,17 +279,23 @@ final class PlayerModel {
         applyPowerSaving()
         bookmarks = BookmarkStore.load(from: Self.supportDirectory)
         resumeStore = ResumeStore.load(from: Self.supportDirectory)
+        loudness = LoudnessStore.load(from: Self.supportDirectory)
+        stats = PlayStats.load(from: Self.supportDirectory)
+        engine.matchSampleRate = matchSampleRate
 
         engine.provideNext = { [weak self] in MainActor.assumeIsolated { self?.readyNextItem() } }
         engine.onAdvance = { [weak self] id in MainActor.assumeIsolated { self?.didAdvance(to: id) } }
         engine.onFinished = { [weak self] in MainActor.assumeIsolated { self?.didFinish() } }
         engine.onTick = { [weak self] pos, dur in MainActor.assumeIsolated { self?.tick(pos, dur) } }
         engine.onConfigurationChange = { [weak self] in MainActor.assumeIsolated { self?.reloadAfterDeviceChange() } }
+        engine.onStartFailure = { [weak self] in MainActor.assumeIsolated { self?.engineFailedToStart() } }
 
         refreshOutputDevices()
         if let uid = outputDeviceUID, let d = outputDevices.first(where: { $0.uid == uid }) {
             engine.setOutputDevice(d.id)
         }
+        applyDeviceProfile()
+        if exclusiveMode { applyExclusiveMode() }
         setupRemoteCommands()
         restore()
     }
@@ -297,6 +369,60 @@ final class PlayerModel {
         loadMetadata(tracks)
         if play, let first = tracks.first { self.play(first) }
         scheduleSave()
+    }
+
+    // MARK: - ライブラリ・プレイリストからの再生
+
+    /// 再生キューに入れるための写し (キューの中で見分けるための ID を新しくする)
+    private func fresh(_ tracks: [Track]) -> [Track] {
+        tracks.map { var t = $0; t.id = UUID(); return t }
+    }
+
+    /// 再生キューを置き換えて、index 番目から再生する
+    func playNow(_ tracks: [Track], startAt index: Int = 0) {
+        guard !tracks.isEmpty else { return }
+        let list = fresh(tracks)
+        rememberPosition()
+        engine.stop()
+        queue = list
+        selection.removeAll()
+        let first = list[min(max(0, index), list.count - 1)]
+        currentID = nil
+        shuffleOrder = []
+        if shuffle {
+            currentID = first.id
+            rebuildShuffle()
+        }
+        loadMetadata(list)
+        play(first)
+        scheduleSave()
+    }
+
+    /// 再生キューに足す。next なら今の曲のすぐあと、そうでなければ末尾
+    func enqueue(_ tracks: [Track], next: Bool = false) {
+        guard !tracks.isEmpty else { return }
+        let list = fresh(tracks)
+        let at: Int? = next ? (currentID.flatMap { id in queue.firstIndex { $0.id == id } }.map { $0 + 1 } ?? 0) : nil
+        let wasEmpty = queue.isEmpty
+        insert(list, at: at, play: wasEmpty)
+        if next, shuffle {
+            // シャッフル中も、次に再生されるようにする
+            shuffleOrder.removeAll { id in list.contains { $0.id == id } }
+            let s = (currentID.flatMap { shuffleOrder.firstIndex(of: $0) } ?? -1) + 1
+            shuffleOrder.insert(contentsOf: list.map(\.id), at: s)
+            engine.invalidateUpcoming()
+        }
+        showToast(next ? "\(list.count) 曲を次に再生します" : "\(list.count) 曲を再生キューに追加しました", symbol: "text.badge.plus")
+    }
+
+    /// 今の再生キューを、名前を付けたプレイリストとして保存する (名前は最初の曲のアルバム名か日付)
+    func saveQueueAsPlaylist() {
+        guard !queue.isEmpty else { return }
+        let formatter = DateFormatter()
+        formatter.dateFormat = "M/d H:mm"
+        let name = queue.first?.meta.album?.nilIfBlank ?? "キュー \(formatter.string(from: Date()))"
+        let playlist = LibraryStore.shared.createPlaylist(name: name, tracks: fresh(queue))
+        showToast("プレイリスト「\(playlist.name)」に \(queue.count) 曲を保存しました", symbol: "music.note.list")
     }
 
     func playNext(_ ids: Set<UUID>) {
@@ -418,12 +544,19 @@ final class PlayerModel {
             do {
                 let needsConversion = playable[track.url] == nil
                 if needsConversion { isPreparing = true }
+                if needsLoudness(track) { isPreparing = true }
+                await ensureLoudness(for: track)
                 let item = try await makeItem(track)
+                guard loadToken == token else { return }
+                await engine.prepareOutput(for: item)
                 guard loadToken == token else { return }
                 isPreparing = false
                 conversionProgress = nil
                 engine.load(item, at: seconds, play: autoplay)
                 isPlaying = autoplay
+                if changed { resetListening() }
+                applyASMR()
+                outputRevision += 1
                 consecutiveFailures = 0
                 failed.remove(track.id)
                 if waveform == nil { loadWaveform(for: track) }
@@ -522,6 +655,16 @@ final class PlayerModel {
     }
 
     func skip(by delta: Double) { seek(to: clock.position + delta) }
+
+    /// 再生速度を少し変える (0.5〜2 倍)。ASMR モード中は等速のまま
+    func changeRate(by delta: Double) {
+        guard !asmrMode else {
+            showToast("ASMR モード中は速度を変えられません", symbol: "ear")
+            return
+        }
+        rate = min(2, max(0.5, ((rate + delta) * 100).rounded() / 100))
+        showToast("速度 \(rateLabel(rate))", symbol: "gauge.with.dots.needle.67percent")
+    }
 
     func toggleABLoop() {
         let pos = clock.position
@@ -758,7 +901,14 @@ final class PlayerModel {
         Defaults.set("outputDevice", device?.uid)
         let pos = clock.position, wasPlaying = isPlaying
         engine.setOutputDevice(device?.id)
-        if let t = currentTrack, engine.current != nil { play(t, at: pos, autoplay: wasPlaying) }
+        applyDeviceProfile()
+        outputRevision += 1
+        if exclusiveMode {
+            // 排他モードは、新しいデバイスで取り直す (終わったら読み込み直す)
+            applyExclusiveMode()
+        } else if let t = currentTrack, engine.current != nil {
+            play(t, at: pos, autoplay: wasPlaying)
+        }
     }
 
     // MARK: - エンジン連携
@@ -771,15 +921,258 @@ final class PlayerModel {
 
     private func gain(for t: Track) -> Float {
         let m = t.meta
-        let (g, p): (Double?, Double?) = switch replayGain {
+        var (g, p): (Double?, Double?) = switch replayGain {
         case .off: (nil, nil)
         case .track: (m.rgTrackGain ?? m.rgAlbumGain, m.rgTrackPeak ?? m.rgAlbumPeak)
         case .album: (m.rgAlbumGain ?? m.rgTrackGain, m.rgAlbumPeak ?? m.rgTrackPeak)
+        }
+        // タグがない曲は、測ってあればその値でそろえる (ASMR モードでは、音量のならしに任せる)
+        if g == nil, usesLoudnessScan, let measured = measuredLoudness(for: t), let gain = measured.gainDB {
+            (g, p) = (gain, measured.peak)
         }
         guard let g else { return 1 }
         var linear = pow(10, g / 20)
         if let p, p > 0 { linear = min(linear, 1 / p) }
         return Float(linear)
+    }
+
+    // MARK: - ラウドネスの解析
+
+    private var usesLoudnessScan: Bool { loudnessScan && replayGain != .off && !asmrMode }
+
+    /// 今の曲の、音量をそろえるためのゲイン (dB) と、その出どころ
+    var currentGainInfo: (db: Double, source: String)? {
+        guard let item = engine.current, abs(item.gain - 1) > 0.0005, let t = currentTrack else { return nil }
+        let tagged = t.meta.rgTrackGain != nil || t.meta.rgAlbumGain != nil
+        return (20 * log10(Double(item.gain)), tagged ? "ReplayGain" : "解析した大きさ")
+    }
+
+    /// 測ってある大きさ (まだ測っていなければ nil)
+    func measuredLoudness(for t: Track) -> LoudnessResult? {
+        guard let source = playable[t.url] ?? (Importer.mediaExtensions.contains(t.url.pathExtension.lowercased()) ? t.url : nil),
+              let key = LoudnessScanner.key(for: source, start: t.start) else { return nil }
+        return loudness[key]
+    }
+
+    /// 曲の大きさを測る (曲の情報のパネルから呼ぶ)
+    func measureLoudness(_ t: Track) async {
+        if await scanLoudness(t) == nil {
+            showToast("大きさを測れませんでした: \(t.fileName)", symbol: "exclamationmark.triangle")
+        }
+    }
+
+    private func needsLoudness(_ t: Track) -> Bool {
+        usesLoudnessScan && t.meta.rgTrackGain == nil && t.meta.rgAlbumGain == nil
+    }
+
+    /// 曲の大きさを測る (測ってあれば何もしない)。結果は保存する
+    @discardableResult
+    private func scanLoudness(_ t: Track) async -> LoudnessResult? {
+        guard let source = try? await playableURL(for: t.url),
+              let key = LoudnessScanner.key(for: source, start: t.start) else { return nil }
+        if let known = loudness[key] { return known }
+        if let running = loudnessInFlight[key] { return await running.value }
+        let (start, end) = (t.start, t.end)
+        let task = Task.detached(priority: .utility) { LoudnessScanner.measure(source, start: start, end: end) }
+        loudnessInFlight[key] = task
+        let result = await task.value
+        loudnessInFlight[key] = nil
+        if let result {
+            loudness.set(result, for: key)
+            let store = loudness, dir = Self.supportDirectory
+            Task.detached(priority: .utility) { store.save(to: dir) }
+        }
+        return result
+    }
+
+    /// 再生の前に、必要なら大きさを測っておく。長い曲は待たずに裏で測り、次に再生するときから使う
+    private func ensureLoudness(for t: Track) async {
+        guard needsLoudness(t) else { return }
+        if (t.duration ?? 0) <= 20 * 60 {
+            await scanLoudness(t)
+        } else {
+            Task { await scanLoudness(t) }
+        }
+    }
+
+    // MARK: - 再生回数・お気に入り
+
+    private func resetListening() {
+        listened = 0
+        counted = false
+        lastListenTick = 0
+    }
+
+    /// 聴いた時間を足し、曲の半分 (または 4 分) を聴いたら 1 回の再生として数える
+    private func trackListening() {
+        let now = CACurrentMediaTime()
+        defer { lastListenTick = now }
+        guard isPlaying, lastListenTick > 0, now - lastListenTick < 1, !counted, let t = currentTrack else { return }
+        listened += (now - lastListenTick) * effectiveRate
+        if PlayStats.counts(listened: listened, duration: clock.duration) {
+            counted = true
+            stats.recordPlay(t.bookmarkKey)
+            saveStats()
+        }
+    }
+
+    var isCurrentFavorite: Bool { currentTrack.map { stats[$0.bookmarkKey].favorite } ?? false }
+
+    func isFavorite(_ track: Track) -> Bool { stats[track.bookmarkKey].favorite }
+
+    func toggleFavorite(_ track: Track? = nil) {
+        guard let t = track ?? currentTrack else { return }
+        let on = !stats[t.bookmarkKey].favorite
+        stats.setFavorite(t.bookmarkKey, on)
+        saveStats()
+        if track == nil { showToast(on ? "お気に入りに追加しました" : "お気に入りから外しました", symbol: on ? "heart.fill" : "heart") }
+    }
+
+    private func saveStats() {
+        let all = stats, dir = Self.supportDirectory
+        Task.detached(priority: .utility) { all.save(to: dir) }
+    }
+
+    // MARK: - パラメトリック EQ
+
+    /// 今の出力デバイスを表す ID (システムの設定に従うときは、そのときの既定のデバイス)
+    var currentOutputUID: String {
+        if let uid = outputDeviceUID { return uid }
+        let id = engine.outputDeviceID
+        return outputDevices.first { $0.id == id }?.uid ?? "default"
+    }
+
+    var activeProfile: EQProfile? { eqProfiles.first { $0.id == activeProfileID } }
+
+    /// 設定を追加して、使うものにする
+    func addProfile(_ profile: EQProfile) {
+        eqProfiles.append(profile)
+        activeProfileID = profile.id
+    }
+
+    func updateProfile(_ profile: EQProfile) {
+        guard let i = eqProfiles.firstIndex(where: { $0.id == profile.id }) else { return }
+        eqProfiles[i] = profile
+    }
+
+    func removeProfile(_ id: UUID) {
+        eqProfiles.removeAll { $0.id == id }
+        if activeProfileID == id { activeProfileID = nil }
+    }
+
+    /// AutoEQ (Equalizer APO 形式) の設定ファイルを読み込む
+    func importAutoEQ(from url: URL) {
+        guard let text = TextDecoding.readText(at: url), let parsed = EQDesign.parseAutoEQ(text) else {
+            showToast("EQ の設定として読み込めませんでした: \(url.lastPathComponent)", symbol: "exclamationmark.triangle")
+            return
+        }
+        var name = url.deletingPathExtension().lastPathComponent
+        for suffix in [" ParametricEQ", " parametric", "_ParametricEQ"] where name.hasSuffix(suffix) { name.removeLast(suffix.count) }
+        addProfile(EQProfile(name: name, preamp: parsed.preamp, bands: Array(parsed.bands.prefix(ASMRShared.eqBands - 1))))
+        showToast("「\(name)」を読み込みました（\(parsed.bands.count) バンド）", symbol: "headphones")
+    }
+
+    /// 出力デバイスが変わったとき: そのデバイス用に覚えている設定へ切り替える
+    private func applyDeviceProfile() {
+        guard let stored = deviceProfiles[currentOutputUID] else { return }
+        let id = UUID(uuidString: stored)
+        if id != activeProfileID, id == nil || eqProfiles.contains(where: { $0.id == id }) { activeProfileID = id }
+    }
+
+    // MARK: - 出力までの道筋
+
+    /// 排他モードを取る / 手放す (少し時間がかかる)。終わったら、今の曲を同じ位置から読み込み直す
+    private func applyExclusiveMode() {
+        let wasPlaying = isPlaying
+        let position = clock.position
+        switchingExclusive = true
+        Task {
+            let ok = await engine.setExclusiveMode(exclusiveMode)
+            switchingExclusive = false
+            outputRevision += 1
+            if exclusiveMode, !ok {
+                showToast("排他モードにできませんでした（ほかのアプリが使っているか、このデバイスは対応していません）", symbol: "exclamationmark.triangle")
+            }
+            if let t = currentTrack, engine.current != nil { play(t, at: position, autoplay: wasPlaying) }
+        }
+    }
+
+    /// エンジンを始められなかった: 再生中の表示のまま固まらないよう、止めて知らせる
+    private func engineFailedToStart() {
+        isPlaying = false
+        updateNowPlayingInfo()
+        showToast("出力デバイスで再生を始められませんでした。出力デバイスの設定を確かめてください", symbol: "exclamationmark.triangle")
+    }
+
+    /// 出力デバイスまわりの設定を変えたあと、今の曲を読み込み直す
+    private func reloadForOutputChange() {
+        outputRevision += 1
+        guard let t = currentTrack, engine.current != nil else { return }
+        play(t, at: clock.position, autoplay: isPlaying)
+    }
+
+    /// 加工で音が大きくなりうるか (クリップ防止を働かせるかどうかの判断に使う)
+    private var mayExceedFullScale: Bool {
+        if eqEnabled, eqPreamp > 0 || eqBands.contains(where: { $0 > 0 }) { return true }
+        if let profile = activeProfile, !profile.isFlat { return true }
+        if crossfeed != .off || effectiveRate != 1 || pitch != 0 { return true }
+        return (engine.current?.gain ?? 1) > 1.0005
+    }
+
+    var signalPath: SignalPath? {
+        _ = outputRevision
+        guard let t = currentTrack else { return nil }
+        let m = t.meta
+        var parts: [String] = []
+        if let codec = m.codec { parts.append(codec) }
+        if let bits = m.bitDepth, bits > 1 { parts.append("\(bits)bit") }
+        let fileRate = engine.current?.sampleRate ?? m.sampleRate ?? 0
+        if fileRate > 0 { parts.append(Self.sampleRateLabel(fileRate)) }
+        if let br = m.bitrate, m.lossless != true, br > 0 { parts.append("\(br / 1000)kbps") }
+
+        var stages: [SignalPath.Stage] = []
+        if let gain = currentGainInfo {
+            stages.append(.init(name: "音量の均一化", detail: String(format: "%@ %+.1f dB", gain.source, gain.db), symbol: "speaker.wave.2"))
+        }
+        if !asmrMode {
+            if eqEnabled, eqPreamp != 0 || eqBands.contains(where: { $0 != 0 }) {
+                stages.append(.init(name: "イコライザー", detail: eqPresetName, symbol: "slider.vertical.3"))
+            }
+            if let profile = activeProfile, !profile.isFlat {
+                stages.append(.init(name: "パラメトリック EQ", detail: profile.name, symbol: "headphones"))
+            }
+            if effectiveRate != 1 || pitch != 0 {
+                stages.append(.init(name: "速度・キー", detail: rateLabel(effectiveRate) + (pitch != 0 ? String(format: " / %+.0f", pitch) : ""), symbol: "gauge.with.dots.needle.67percent"))
+            }
+            if balance != 0 { stages.append(.init(name: "バランス", detail: balance < 0 ? "左寄り" : "右寄り", symbol: "slider.horizontal.below.rectangle")) }
+            if crossfeed != .off { stages.append(.init(name: "クロスフィード", detail: crossfeed.label, symbol: "ear")) }
+            if clipGuard, mayExceedFullScale { stages.append(.init(name: "クリップ防止", detail: "-0.1 dBFS", symbol: "waveform.badge.exclamationmark")) }
+        } else {
+            stages.append(.init(name: "ASMR モード", detail: "音量のならし（\(asmrStrength.label)）・リミッター", symbol: "ear"))
+        }
+        let chainRate = engine.chainSampleRate
+        let resampled = fileRate > 0 && abs(fileRate - chainRate) > 0.5
+        if resampled {
+            stages.append(.init(name: "サンプルレート変換", detail: "\(Self.sampleRateLabel(fileRate)) → \(Self.sampleRateLabel(chainRate))（最高品質）", symbol: "arrow.triangle.2.circlepath"))
+        }
+        let softVolume = muted || volume < 0.9995
+        if softVolume {
+            stages.append(.init(name: "音量", detail: muted ? "消音" : String(format: "%.1f dB", 40 * log10(max(volume, 0.0001))), symbol: "speaker.wave.1"))
+        }
+        let info = engine.outputInfo
+        var output = info.name + " · " + Self.sampleRateLabel(info.rate)
+        if let bits = info.bits, bits > 0 { output += " / \(bits)bit" }
+        if let transport = info.transport { output += "（\(transport)）" }
+        if engine.isExclusive { output += " · 排他" }
+
+        let processed = stages.contains { !["サンプルレート変換", "音量"].contains($0.name) }
+        let quality: SignalPath.Quality = processed ? .processed : resampled ? .resampled : softVolume ? .volumeOnly : .bitPerfect
+        return SignalPath(source: parts.joined(separator: " · "), stages: stages, output: output, quality: quality)
+    }
+
+    static func sampleRateLabel(_ rate: Double) -> String {
+        let k = rate / 1000
+        return k == k.rounded() ? "\(Int(k))kHz" : String(format: "%.1fkHz", k)
     }
 
     /// 再生可能な URL (ネイティブ非対応形式は ffmpeg で FLAC に変換)
@@ -820,7 +1213,10 @@ final class PlayerModel {
     }
 
     private func prepareNext() {
-        guard let n = nextTrack(after: currentID, auto: true), playable[n.url] == nil, conversions[n.url] == nil else { return }
+        guard let n = nextTrack(after: currentID, auto: true) else { return }
+        // 次の曲の大きさも先に測っておく (そのまま続けて再生するときに間に合うように)
+        if needsLoudness(n) { Task { await scanLoudness(n) } }
+        guard playable[n.url] == nil, conversions[n.url] == nil else { return }
         Task { _ = try? await playableURL(for: n.url) }
     }
 
@@ -838,6 +1234,9 @@ final class PlayerModel {
             clock.duration = t.duration ?? clock.duration
             if changed { present(t) }
         }
+        if changed { resetListening() }
+        applyASMR()
+        outputRevision += 1
         updateNowPlayingInfo()
         prepareNext()
         scheduleSave()
@@ -882,12 +1281,15 @@ final class PlayerModel {
             let fade = SleepFade.step(from: engine.fadeMultiplier, to: target)
             if fade != engine.fadeMultiplier { engine.fadeMultiplier = fade }
         }
+        trackListening()
         // 外部 (コントロールセンター) の位置表示がずれないよう時々同期
         if abs(position - lastNowPlayingSync) > 5 { updateNowPlayingInfo() }
     }
 
     private func reloadAfterDeviceChange() {
         refreshOutputDevices()
+        applyDeviceProfile()
+        outputRevision += 1
         guard let t = currentTrack, engine.current != nil else { return }
         play(t, at: clock.position, autoplay: isPlaying)
     }
@@ -912,26 +1314,44 @@ final class PlayerModel {
         if asmrMode, asmrLoudness { applyASMR() }
     }
 
-    private func applyEQ() { engine.setEQ(bands: eqBands, preamp: eqPreamp, enabled: eqEnabled && !asmrMode) }
+    private func applyEQ() {
+        engine.setEQ(bands: eqBands, preamp: eqPreamp, enabled: eqEnabled && !asmrMode)
+        applyASMR()
+    }
 
     private func applyRate() {
         engine.rate = Float(effectiveRate)
         engine.pitch = asmrMode ? 0 : Float(pitch)
+        applyASMR()
         updateNowPlayingInfo()
     }
 
     private func applyBalance() { engine.balance = asmrMode ? 0 : Float(balance) }
 
+    /// 最後段の処理ユニットの設定を組み立てる (ASMR モードの処理と、通常の再生でのクロスフィード・クリップ防止・パラメトリック EQ)
     private func applyASMR() {
         var s = ASMRSettings()
-        s.dynamics = asmrMode
-        s.limiter = asmrMode
+        // 「処理前の音と比べる」の間は、音量のならしなどを外す (左右の入れ替えとリミッターは残す)
+        let processing = asmrMode && !asmrCompare
+        s.dynamics = processing
         s.swap = asmrMode && swapChannels
-        asmrStrength.apply(to: &s)
-        (asmrMode ? asmrSoftening : .off).apply(to: &s)
-        (s.loudnessLow, s.loudnessHigh) = loudnessBoost
+        asmrStrength.apply(to: &s, custom: asmrCustom)
+        (processing ? asmrSoftening : .off).apply(to: &s)
+        if processing {
+            (s.loudnessLow, s.loudnessHigh) = loudnessBoost
+            s.lowCut = Float(asmrLowCut)
+        }
+        if asmrMode {
+            s.limiter = true
+        } else {
+            if let feed = crossfeed.parameters { (s.crossfeedCut, s.crossfeedLevel) = feed }
+            // 加工していないときはリミッターも入れず、元の音を 1 ビットも変えない
+            s.limiter = clipGuard && mayExceedFullScale
+            s.ceiling = 0.9886   // -0.1 dBFS
+        }
         engine.asmrSettings = s
         engine.softTransitions = asmrMode
+        engine.eqProfile = asmrMode ? nil : activeProfile
     }
 
     private func applyPowerSaving() {
@@ -1100,7 +1520,7 @@ final class PlayerModel {
         var splits: [(Int, [Track])] = []
         for i in q.indices {
             guard !q[i].meta.loaded, let m = buffer[q[i].url] else { continue }
-            q[i].meta = merged(q[i], m)
+            q[i].meta = q[i].merging(m)
             if let parts = Importer.splitEmbeddedCue(q[i]) { splits.append((i, parts)) }
         }
         for (i, parts) in splits.reversed() {
@@ -1115,28 +1535,6 @@ final class PlayerModel {
             if lyrics == nil, t.meta.hasEmbeddedLyrics { present(t) }
         }
         scheduleSave()
-    }
-
-    private func merged(_ t: Track, _ m: TrackMeta) -> TrackMeta {
-        var out = m
-        let old = t.meta
-        if t.isCueTrack {
-            out.title = old.title ?? m.title
-            out.artist = old.artist ?? m.artist
-            out.album = old.album ?? m.album
-            out.albumArtist = old.albumArtist ?? m.albumArtist
-            out.trackNumber = old.trackNumber
-            out.year = old.year ?? m.year
-            out.genre = old.genre ?? m.genre
-            out.rgTrackGain = nil
-            out.rgTrackPeak = nil
-            out.hasEmbeddedLyrics = false
-            out.embeddedCueSheet = nil
-        } else {
-            out.title = m.title ?? old.title
-            out.artist = m.artist ?? old.artist
-        }
-        return out
     }
 
     // MARK: - Now Playing (コントロールセンター・メディアキー)
@@ -1254,5 +1652,7 @@ enum Defaults {
     static func string(_ k: String) -> String? { UserDefaults.standard.string(forKey: k) }
     static func array(_ k: String) -> [Any]? { UserDefaults.standard.array(forKey: k) }
     static func data(_ k: String) -> Data? { UserDefaults.standard.data(forKey: k) }
+    static func codable<T: Decodable>(_ k: String) -> T? { data(k).flatMap { try? JSONDecoder().decode(T.self, from: $0) } }
+    static func setCodable<T: Encodable>(_ k: String, _ v: T) { set(k, try? JSONEncoder().encode(v)) }
     static func set(_ k: String, _ v: Any?) { UserDefaults.standard.set(v, forKey: k) }
 }

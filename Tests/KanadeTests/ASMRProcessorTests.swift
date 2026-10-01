@@ -20,7 +20,7 @@ struct ASMRProcessorTests {
 
     // MARK: 素通し
 
-    @Test("すべてオフなら、3ms 遅れるだけで音は変わらない")
+    @Test("すべてオフなら、先読みの分だけ遅れるだけで音は変わらない")
     func passthroughWhenOff() {
         let input = noiseSignal(Self.speech)
         let output = process(input, settings: ASMRSettings())

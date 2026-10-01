@@ -1,9 +1,9 @@
 import Foundation
 @testable import Kanade
 
-/// テストで使うサンプルレートと、リミッターの先読みによる遅れ (サンプル)
+/// テストで使うサンプルレートと、先読みによる遅れ (サンプル)
 let testSampleRate = 48000.0
-let latency = Int(0.003 * testSampleRate)
+let latency = ASMRKernel.latencyFrames(sampleRate: testSampleRate)
 
 struct Stereo {
     var left: [Float]
@@ -69,14 +69,18 @@ func sine(_ frequency: Double, amplitude: Float, seconds: Double) -> Stereo {
 
 /// 処理本体 (ASMRKernel) を、実際の描画と同じく 512 サンプルずつ動かす。
 /// `changes` に入れた設定は、そのサンプル位置に来たところで差し替える (再生中の設定変更)。
-func process(_ input: Stereo, settings: ASMRSettings, changes: [(at: Int, settings: ASMRSettings)] = []) -> Stereo {
+/// `eq` はパラメトリック EQ の係数、`eqChanges` は途中での差し替え
+func process(_ input: Stereo, settings: ASMRSettings, changes: [(at: Int, settings: ASMRSettings)] = [],
+             eq: [[Float]] = [], eqChanges: [(at: Int, eq: [[Float]])] = [], sampleRate: Double = testSampleRate) -> Stereo {
     var kernel = ASMRKernel()
-    kernel.prepare(sampleRate: testSampleRate, maxFrames: 4096)
+    kernel.prepare(sampleRate: sampleRate, maxFrames: 4096)
     defer { kernel.release() }
     let shared = ASMRShared()
     shared.publish(settings)
+    if !eq.isEmpty { shared.publishEQ(eq) }
 
     var pending = changes.sorted { $0.at < $1.at }
+    var pendingEQ = eqChanges.sorted { $0.at < $1.at }
     var left = input.left, right = input.right
     let total = input.count
     left.withUnsafeMutableBufferPointer { l in
@@ -86,6 +90,10 @@ func process(_ input: Stereo, settings: ASMRSettings, changes: [(at: Int, settin
                 while let change = pending.first, change.at <= position {
                     shared.publish(change.settings)
                     pending.removeFirst()
+                }
+                while let change = pendingEQ.first, change.at <= position {
+                    shared.publishEQ(change.eq)
+                    pendingEQ.removeFirst()
                 }
                 kernel.sync(shared)
                 let frames = min(512, total - position)

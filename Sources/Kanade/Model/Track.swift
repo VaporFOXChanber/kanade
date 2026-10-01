@@ -132,6 +132,31 @@ struct Track: Identifiable, Codable, Hashable {
     }
 }
 
+extension Track {
+    /// ファイルから読んだタグを取り込んだ結果。CUE で分けた曲は、CUE シートに書かれていた曲名などを優先する
+    func merging(_ m: TrackMeta) -> TrackMeta {
+        var out = m
+        let old = meta
+        if isCueTrack {
+            out.title = old.title ?? m.title
+            out.artist = old.artist ?? m.artist
+            out.album = old.album ?? m.album
+            out.albumArtist = old.albumArtist ?? m.albumArtist
+            out.trackNumber = old.trackNumber
+            out.year = old.year ?? m.year
+            out.genre = old.genre ?? m.genre
+            out.rgTrackGain = nil
+            out.rgTrackPeak = nil
+            out.hasEmbeddedLyrics = false
+            out.embeddedCueSheet = nil
+        } else {
+            out.title = m.title ?? old.title
+            out.artist = m.artist ?? old.artist
+        }
+        return out
+    }
+}
+
 struct TrackMeta: Codable, Hashable {
     var loaded = false
     var title: String?

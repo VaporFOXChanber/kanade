@@ -30,6 +30,7 @@ struct QueueView: View {
                         Button("ランダムに並べ替え") { model.sort(by: .random) }
                     }
                     Button("重複を削除") { model.removeDuplicates() }
+                    Button("プレイリストとして保存") { model.saveQueueAsPlaylist() }
                     Button("プレイリストを書き出す…") { exportPlaylist() }
                     Divider()
                     Button("キューを消去", role: .destructive) { model.clearQueue() }
@@ -92,6 +93,17 @@ struct QueueView: View {
                         if !ids.isEmpty {
                             Button("再生") { if let t = model.track(ids.first) { model.start(t) } }
                             Button("次に再生") { model.playNext(ids) }
+                            Button("お気に入りに追加 / 外す") { ids.compactMap(model.track).forEach { model.toggleFavorite($0) } }
+                            Menu("プレイリストに追加") {
+                                let tracks = model.queue.filter { ids.contains($0.id) }
+                                ForEach(LibraryStore.shared.playlists) { p in
+                                    Button(p.name) { LibraryStore.shared.append(tracks, to: p.id) }
+                                }
+                                if !LibraryStore.shared.playlists.isEmpty { Divider() }
+                                Button("新しいプレイリスト…") {
+                                    LibraryStore.shared.createPlaylist(name: tracks.first?.displayTitle ?? "新しいプレイリスト", tracks: tracks)
+                                }
+                            }
                             Button("Finder で表示") {
                                 NSWorkspace.shared.activateFileViewerSelecting(ids.compactMap { model.track($0)?.url })
                             }

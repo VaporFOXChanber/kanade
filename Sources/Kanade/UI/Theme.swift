@@ -1,4 +1,5 @@
 import AppKit
+import CoreImage
 import ImageIO
 import SwiftUI
 
@@ -109,6 +110,7 @@ final class ArtworkStore {
 
     @ObservationIgnored private let full = NSCache<NSString, NSImage>()
     @ObservationIgnored private let thumbs = NSCache<NSString, NSImage>()
+    @ObservationIgnored private let covers = NSCache<NSString, NSImage>()
     @ObservationIgnored private var missing = Set<String>()
     @ObservationIgnored private var inflight: [String: Task<NSImage?, Never>] = [:]
     /// 手動で指定したアートワーク: 作品のキー (ArtworkFinder.workKey) → 保存したファイル名
@@ -122,6 +124,7 @@ final class ArtworkStore {
     init() {
         full.countLimit = 24
         thumbs.countLimit = 600
+        covers.countLimit = 240
         Self.files.countLimit = 80
         if let data = try? Data(contentsOf: customIndexURL),
            let index = try? JSONDecoder().decode([String: String].self, from: data) { custom = index }
@@ -137,6 +140,15 @@ final class ArtworkStore {
 
     func cachedThumbnail(for track: Track) -> NSImage? {
         thumbs.object(forKey: ("t:" + track.artworkKey) as NSString)
+    }
+
+    /// ライブラリのアルバム一覧用 (中くらいの大きさ)
+    func cover(for track: Track) async -> NSImage? {
+        await load(track, maxPixel: 360, cache: covers, prefix: "c:")
+    }
+
+    func cachedCover(for track: Track) -> NSImage? {
+        covers.object(forKey: ("c:" + track.artworkKey) as NSString)
     }
 
     private func load(_ track: Track, maxPixel: Int, cache: NSCache<NSString, NSImage>, prefix: String) async -> NSImage? {
@@ -180,6 +192,7 @@ final class ArtworkStore {
     func invalidate() {
         full.removeAllObjects()
         thumbs.removeAllObjects()
+        covers.removeAllObjects()
         Self.files.removeAllObjects()
         missing.removeAll()
         ArtworkFinder.clearCache()
@@ -246,7 +259,46 @@ final class ArtworkStore {
             kCGImageSourceCreateThumbnailWithTransform: true,
             kCGImageSourceThumbnailMaxPixelSize: maxPixel,
         ]
-        guard let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) else { return NSImage(data: data) }
+        guard let thumbnail = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) else { return NSImage(data: data) }
+        let cg = squared(thumbnail)
         return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+    }
+
+    nonisolated private static let blurContext = CIContext(options: [.cacheIntermediates: false])
+
+    /// 正方形でない画像を、正方形のアートワークにする。
+    /// 画像は切り取らずに全体を収め、余った部分は同じ画像を大きくぼかしたもので埋める
+    /// (ほぼ正方形の画像は、そのまま返して表示側で端を少しだけ切る)
+    nonisolated static func squared(_ image: CGImage) -> CGImage {
+        let w = image.width, h = image.height
+        guard w > 0, h > 0 else { return image }
+        let ratio = Double(w) / Double(h)
+        guard ratio < 0.95 || ratio > 1.05 else { return image }
+        let side = max(w, h)
+        guard let context = CGContext(data: nil, width: side, height: side, bitsPerComponent: 8, bytesPerRow: 0,
+                                      space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return image }
+        let canvas = CGRect(x: 0, y: 0, width: side, height: side)
+        // 背景: 画像を正方形いっぱいに広げてぼかし、少し暗くする
+        let scale = CGFloat(side) / CGFloat(min(w, h))
+        let fill = CGRect(x: (CGFloat(side) - CGFloat(w) * scale) / 2, y: (CGFloat(side) - CGFloat(h) * scale) / 2,
+                          width: CGFloat(w) * scale, height: CGFloat(h) * scale)
+        let source = CIImage(cgImage: image)
+            .transformed(by: CGAffineTransform(translationX: fill.minX, y: fill.minY).scaledBy(x: scale, y: scale))
+            .clampedToExtent()
+            .applyingGaussianBlur(sigma: Double(side) * 0.05)
+            .cropped(to: canvas)
+        if let blurred = blurContext.createCGImage(source, from: canvas) {
+            context.draw(blurred, in: canvas)
+        } else {
+            context.interpolationQuality = .low
+            context.draw(image, in: fill)
+        }
+        context.setFillColor(CGColor(gray: 0, alpha: 0.28))
+        context.fill(canvas)
+        // 手前: 画像全体を中央に収める
+        context.interpolationQuality = .high
+        context.draw(image, in: CGRect(x: (side - w) / 2, y: (side - h) / 2, width: w, height: h))
+        return context.makeImage() ?? image
     }
 }

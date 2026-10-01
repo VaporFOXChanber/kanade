@@ -168,6 +168,35 @@ final class AudioEngine {
     /// フェードアウトが終わるのを待っている一時停止があるか
     private var pausePending = false
     private var pauseGeneration = 0
+    /// EQ から出力までの経路のサンプルレート。出力デバイスに合わせる
+    private(set) var chainSampleRate: Double = 48000
+    private let offline: Bool
+    /// 選ばれている出力デバイス (nil ならシステムの設定に従う)
+    private var selectedDevice: AudioDeviceID?
+    /// デバイスのサンプルレートを曲に合わせて切り替える (切り替えられれば、サンプルレートの変換が入らない)
+    var matchSampleRate = false
+    /// 出力デバイスを排他的に使う (ほかのアプリの音が混ざらない)
+    /// (切り替えは setExclusiveMode で行う)
+    private(set) var exclusiveMode = false
+    private var hoggedDevice: AudioDeviceID?
+    /// 排他モードの切り替えの途中か (曲の読み込みは、これが終わるのを待つ)
+    private var switchingExclusive = false
+    /// エンジンを始められなかった (出力デバイスが使えないなど)
+    var onStartFailure: (() -> Void)?
+    /// こちらで切り替える前の、デバイスのサンプルレート (終了時に戻す)
+    private var originalRates: [AudioDeviceID: Double] = [:]
+    /// こちらでデバイスを切り替えている最中か (終わったあとで読み込み直すので、その間は立て直しをしない)
+    private var reconfiguring = false
+    /// 出力の構成が変わったあとの確認を予約してあるか
+    private var recoveryScheduled = false
+    private var lastRecovery: CFTimeInterval = 0
+    /// 再生中のはずなのにエンジンが止まっている状態が続いた回数 (tick ごと)
+    private var stalledTicks = 0
+    /// 直前にこちらで切り替えたサンプルレート (ほかのアプリに戻されたときに、取り合いを続けないため)
+    private var lastRateSwitch: (target: Double, time: CFTimeInterval)?
+    /// パラメトリック EQ の設定 (nil なら使わない)
+    var eqProfile: EQProfile? { didSet { publishEQ() } }
+
     /// 少し待ってから実行する (テストでは、描画した時間どおりに進む仮の時計に差し替える)
     var after: (_ seconds: Double, _ work: @escaping () -> Void) -> Void = { seconds, work in
         DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: work)
@@ -175,9 +204,9 @@ final class AudioEngine {
     /// フェードアウトが終わるのを待っているシークの行き先
     private var pendingSeek: Double?
 
-    /// ASMR の処理状況 (持ち上げ dB, 抑え dB, リミッター dB, 高音のやわらげ dB)
-    var asmrMeters: (boost: Float, cut: Float, limit: Float, soften: Float) {
-        (asmrShared.meters[0], asmrShared.meters[1], asmrShared.meters[2], asmrShared.meters[3])
+    /// 処理ユニットの状況 (持ち上げ dB, 抑え dB, リミッター dB, 高音のやわらげ dB, 入力の大きさ dBFS, 出力の大きさ dBFS)
+    var asmrMeters: (boost: Float, cut: Float, limit: Float, soften: Float, input: Float, output: Float) {
+        (asmrShared.meters[0], asmrShared.meters[1], asmrShared.meters[2], asmrShared.meters[3], asmrShared.meters[4], asmrShared.meters[5])
     }
 
     // コールバック
@@ -192,6 +221,7 @@ final class AudioEngine {
 
     /// - Parameter offlineFormat: テスト用。指定すると音を出さず、`engine.renderOffline` で描画する
     init(offlineFormat: AVAudioFormat? = nil) {
+        offline = offlineFormat != nil
         if let offlineFormat {
             try? engine.enableManualRenderingMode(.offline, format: offlineFormat, maximumFrameCount: 4096)
         }
@@ -212,11 +242,12 @@ final class AudioEngine {
         }
         let chain = AVAudioFormat(standardFormatWithSampleRate: engine.outputNode.outputFormat(forBus: 0).sampleRate > 0
             ? engine.outputNode.outputFormat(forBus: 0).sampleRate : 48000, channels: 2)!
-        engine.connect(sum, to: eq, format: chain)
-        engine.connect(eq, to: timePitch, format: chain)
-        engine.connect(timePitch, to: varispeed, format: chain)
-        engine.connect(varispeed, to: asmr, format: chain)
-        engine.connect(asmr, to: engine.mainMixerNode, format: chain)
+        chainSampleRate = chain.sampleRate
+        connectChain(chain)
+        // サンプルレートの違う曲を変換するときの品質を最高にする
+        // (標準のままだと、変換の誤差が約 40dB 大きく、高域も早く落ち始める)
+        sum.auAudioUnit.renderQuality = 127
+        engine.mainMixerNode.auAudioUnit.renderQuality = 127
         engine.attach(checker)
         engine.connect(checker, to: engine.mainMixerNode, format: ChannelCheck.format)
 
@@ -227,19 +258,297 @@ final class AudioEngine {
             band.gain = 0
             band.bypass = false
         }
+        eq.bypass = true
         applyRate()
         applyVolume()
 
         publishASMR()
+        installTap()
+
+        if !offline { observeDefaultOutput() }
+        NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main) { [weak self] _ in
+            self?.outputConfigurationChanged()
+        }
+        engine.prepare()
+    }
+
+    // MARK: - 出力までの経路
+
+    /// 速度・キーの変更に使う部品を、今つないでいるか。
+    /// これらは「素通し」に設定しても音をわずかに変えてしまうので、使わないときは経路から外す
+    private var timePitchInChain = false
+    private var varispeedInChain = false
+
+    private func connectChain(_ format: AVAudioFormat) {
+        var last: AVAudioNode = eq
+        engine.connect(sum, to: eq, format: format)
+        if timePitchInChain {
+            engine.connect(last, to: timePitch, format: format)
+            last = timePitch
+        }
+        if varispeedInChain {
+            engine.connect(last, to: varispeed, format: format)
+            last = varispeed
+        }
+        engine.connect(last, to: asmr, format: format)
+        engine.connect(asmr, to: engine.mainMixerNode, format: format)
+    }
+
+    private func installTap() {
         let analyzer = spectrum
         asmr.installTap(onBus: 0, bufferSize: 2048, format: nil) { buffer, _ in
             analyzer.process(buffer)
         }
+    }
 
-        NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main) { [weak self] _ in
-            self?.onConfigurationChange?()
-        }
+    /// 経路を別のサンプルレートでつなぎ直す。
+    /// 出力デバイスと同じにしておくと、デバイスと同じサンプルレートの曲は一度も変換されずに出力まで届く
+    /// (再生中の曲は、つなぎ直したあとに読み込み直すこと)
+    func rebuildChain(sampleRate: Double) {
+        guard abs(sampleRate - chainSampleRate) > 0.5 else { return }
+        reconnectChain(sampleRate: sampleRate)
+    }
+
+    private func reconnectChain(sampleRate: Double) {
+        guard sampleRate > 0, let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 2) else { return }
+        let wasRunning = engine.isRunning
+        if wasRunning { engine.pause() }
+        asmr.removeTap(onBus: 0)
+        for node in [sum, eq, timePitch, varispeed, asmr] as [AVAudioNode] { engine.disconnectNodeOutput(node) }
+        connectChain(format)
+        installTap()
+        chainSampleRate = sampleRate
+        publishEQ()
         engine.prepare()
+        if wasRunning { startEngine() }
+    }
+
+    /// 出力デバイスの今のサンプルレート
+    private var deviceSampleRate: Double { engine.outputNode.outputFormat(forBus: 0).sampleRate }
+
+    /// 今の出力デバイス。排他モード中は、取ったデバイス (その間、システムの「既定の出力」からは外れている)
+    private var currentDevice: AudioDeviceID? {
+        guard !offline else { return nil }
+        if let device = selectedDevice ?? hoggedDevice { return device }
+        let fallback = AudioOutputs.defaultDeviceID() ?? 0
+        return fallback == 0 ? nil : fallback
+    }
+
+    var outputDeviceID: AudioDeviceID? { currentDevice }
+
+    /// エンジンの出力が今つながっているデバイス
+    private var outputUnitDevice: AudioDeviceID {
+        guard let unit = engine.outputNode.audioUnit else { return 0 }
+        var device: AudioDeviceID = 0
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        AudioUnitGetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &device, &size)
+        return device
+    }
+
+    /// エンジンの出力先を、このデバイスに指定する
+    private func pinOutput(to device: AudioDeviceID) {
+        guard let unit = engine.outputNode.audioUnit, device != 0 else { return }
+        var id = device
+        AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0,
+                             &id, UInt32(MemoryLayout<AudioDeviceID>.size))
+    }
+
+    /// 条件が成り立つまで待つ (最長 seconds 秒)
+    @MainActor
+    private func wait(upTo seconds: Double, until condition: () -> Bool) async {
+        let limit = CACurrentMediaTime() + seconds
+        while !condition(), CACurrentMediaTime() < limit { try? await Task.sleep(for: .milliseconds(50)) }
+    }
+
+    /// 曲を読み込む前に、出力側を整える。
+    /// 「サンプルレートを曲に合わせる」がオンなら、デバイスを曲に最も合うサンプルレートへ切り替える。
+    /// そのうえで、経路をデバイスのサンプルレートに合わせる
+    @MainActor
+    func prepareOutput(for item: PlaybackItem) async {
+        guard !offline else { return }
+        await wait(upTo: 6) { !switchingExclusive }
+        if matchSampleRate, let device = currentDevice,
+           let target = OutputDevice.bestRate(for: item.sampleRate, available: OutputDevice.availableSampleRates(device)),
+           let now = OutputDevice.nominalSampleRate(device), abs(now - target) > 0.5, !wasJustReverted(from: target) {
+            reconfiguring = true
+            defer { reconfiguring = false }
+            if originalRates[device] == nil { originalRates[device] = now }
+            decks.forEach { $0.stop() }
+            engine.stop()
+            if OutputDevice.setNominalSampleRate(device, target) {
+                // 切り替わるまで待つ (最長 2 秒)
+                await wait(upTo: 2) { abs((OutputDevice.nominalSampleRate(device) ?? 0) - target) < 0.5 }
+                // 切り替えの通知が出そろうのを待つ
+                try? await Task.sleep(for: .milliseconds(150))
+                if abs((OutputDevice.nominalSampleRate(device) ?? 0) - target) < 0.5 {
+                    lastRateSwitch = (target, CACurrentMediaTime())
+                }
+            }
+        }
+        let rate = deviceSampleRate
+        if rate > 0 { rebuildChain(sampleRate: rate) }
+    }
+
+    /// 少し前に同じサンプルレートへ切り替えたのに、今は違う値になっている = ほかのアプリが別の値に戻した。
+    /// 切り替え合いが続かないよう、しばらくはこちらから切り替えない (変換して再生する)
+    private func wasJustReverted(from target: Double) -> Bool {
+        guard let last = lastRateSwitch else { return false }
+        return abs(last.target - target) < 0.5 && CACurrentMediaTime() - last.time < 10
+    }
+
+    // MARK: - 出力が止まったときの立て直し
+
+    /// 出力の構成が変わった (デバイスの抜き差し、サンプルレートの変更など)。このときエンジンは自分で止まる。
+    /// こちらの切り替えの途中なら終わるのを待ち、そのうえで必要なら読み込み直してもらう
+    private func outputConfigurationChanged() {
+        guard !recoveryScheduled else { return }
+        recoveryScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            guard let self else { return }
+            self.recoveryScheduled = false
+            if self.reconfiguring || self.switchingExclusive {
+                self.outputConfigurationChanged()
+                return
+            }
+            self.recoverIfNeeded()
+        }
+    }
+
+    /// 再生中のはずなのにエンジンが止まっている、または経路のサンプルレートがデバイスと合っていなければ、読み込み直してもらう。
+    /// (こちらの切り替えのあとで、すでに再生し直せているなら何もしない)
+    private func recoverIfNeeded() {
+        guard current != nil else { return }
+        let stalled = isPlaying && !pausePending && !engine.isRunning
+        let rate = deviceSampleRate
+        let mismatched = rate > 0 && abs(rate - chainSampleRate) > 0.5
+        guard stalled || mismatched else { return }
+        lastRecovery = CACurrentMediaTime()
+        onConfigurationChange?()
+    }
+
+    /// 再生中のはずなのにエンジンが止まったままになっていないかを見張る (tick から呼ぶ)。
+    /// 通知を取りこぼしても、0.7 秒ほどで読み込み直す
+    private func watchForStall() {
+        guard isPlaying, !pausePending, !reconfiguring, !switchingExclusive, !engine.isRunning else {
+            stalledTicks = 0
+            return
+        }
+        stalledTicks += 1
+        if stalledTicks >= 20, CACurrentMediaTime() - lastRecovery > 3 {
+            stalledTicks = 0
+            lastRecovery = CACurrentMediaTime()
+            onConfigurationChange?()
+        }
+    }
+
+    /// 次の曲へそのまま続けて進めるか (サンプルレートを合わせる設定で、デバイスの切り替えが要るなら進めない)
+    private func canContinue(to next: PlaybackItem) -> Bool {
+        guard matchSampleRate, let device = currentDevice,
+              let target = OutputDevice.bestRate(for: next.sampleRate, available: OutputDevice.availableSampleRates(device)) else { return true }
+        return abs(target - deviceSampleRate) < 0.5
+    }
+
+    /// 排他モードを取る / 手放す。うまくいったかを返す。
+    ///
+    /// 排他モードを取ると、そのデバイスはシステムの「既定の出力」から外れる (デバイスが 1 つなら、既定の出力は「なし」になる)。
+    /// エンジンの出力は既定のデバイスを追うので、そのままだと出力先を見失って、止まったまま始められなくなる。
+    /// そこで、エンジンを止めてから取り、既定の出力の切り替わりが落ち着くのを待って、取ったデバイスを出力先に指定し直す。
+    /// 呼んだ側は、このあと再生中の曲を読み込み直すこと
+    @MainActor
+    @discardableResult
+    func setExclusiveMode(_ on: Bool) async -> Bool {
+        exclusiveMode = on
+        guard !offline else { return false }
+        await wait(upTo: 6) { !switchingExclusive }
+        switchingExclusive = true
+        reconfiguring = true
+        defer {
+            reconfiguring = false
+            switchingExclusive = false
+        }
+        let want = exclusiveMode
+        let target = currentDevice
+        if want, hoggedDevice != nil, hoggedDevice == target { return true }
+        if !want, hoggedDevice == nil { return true }
+
+        decks.forEach { $0.stop() }
+        engine.stop()
+        if let held = hoggedDevice {
+            OutputDevice.setHog(held, false)
+            hoggedDevice = nil
+            // 手放したデバイスが、既定の出力に戻るのを待つ
+            await wait(upTo: 2) { (AudioOutputs.defaultDeviceID() ?? 0) != 0 }
+            try? await Task.sleep(for: .milliseconds(200))
+        }
+        var succeeded = !want
+        if want, let device = target, OutputDevice.setHog(device, true) {
+            hoggedDevice = device
+            // 既定の出力から外れる (その処理がエンジンの出力先を書き換える) のを待ってから、出力先に指定する
+            await wait(upTo: 2) { AudioOutputs.defaultDeviceID() != device }
+            try? await Task.sleep(for: .milliseconds(250))
+            for _ in 0..<12 {
+                pinOutput(to: device)
+                try? await Task.sleep(for: .milliseconds(100))
+                if outputUnitDevice == device, deviceSampleRate > 0 {
+                    succeeded = true
+                    break
+                }
+            }
+            if !succeeded {
+                // 取れたのに出力先にできなかった: 手放して元に戻す
+                OutputDevice.setHog(device, false)
+                hoggedDevice = nil
+                await wait(upTo: 2) { (AudioOutputs.defaultDeviceID() ?? 0) != 0 }
+            }
+        }
+        if hoggedDevice == nil {
+            // 選んであるデバイス (なければ既定の出力) に戻るのを待つ
+            if let selected = selectedDevice { pinOutput(to: selected) }
+            await wait(upTo: 2) { self.deviceSampleRate > 0 }
+        }
+        let rate = deviceSampleRate
+        if rate > 0 { rebuildChain(sampleRate: rate) }
+        return succeeded
+    }
+
+    /// 排他モード中に、システムの既定の出力が変わった (別のデバイスがつながれたなど)。
+    /// エンジンの出力先がそちらへ動いてしまったら、取っているデバイスに戻す
+    private func defaultOutputChanged() {
+        guard !reconfiguring, let held = hoggedDevice else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            guard let self, !self.reconfiguring, self.hoggedDevice == held, self.outputUnitDevice != held else { return }
+            self.pinOutput(to: held)
+            self.outputConfigurationChanged()
+        }
+    }
+
+    private func observeDefaultOutput() {
+        var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+                                                 mScope: kAudioObjectPropertyScopeGlobal,
+                                                 mElement: kAudioObjectPropertyElementMain)
+        AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &address, .main) { [weak self] _, _ in
+            self?.defaultOutputChanged()
+        }
+    }
+
+    /// 排他モードを取れているか
+    var isExclusive: Bool { hoggedDevice != nil }
+
+    /// 切り替えたサンプルレートを元に戻す。終了時 (releaseExclusive) は、排他モードも手放す
+    func restoreOutputDevice(releaseExclusive: Bool = false) {
+        if releaseExclusive, let held = hoggedDevice {
+            OutputDevice.setHog(held, false)
+            hoggedDevice = nil
+        }
+        for (device, rate) in originalRates { OutputDevice.setNominalSampleRate(device, rate) }
+        originalRates.removeAll()
+    }
+
+    /// 出力デバイスの情報 (名前・サンプルレート・ビット深度・つなぎ方)
+    var outputInfo: (name: String, rate: Double, bits: Int?, transport: String?) {
+        guard let device = currentDevice else { return ("出力", deviceSampleRate, nil, nil) }
+        return (OutputDevice.name(device) ?? "出力", OutputDevice.nominalSampleRate(device) ?? deviceSampleRate,
+                OutputDevice.physicalFormat(device)?.bits, OutputDevice.transport(device))
     }
 
     // MARK: - 再生制御
@@ -408,7 +717,8 @@ final class AudioEngine {
     func setEQ(bands: [Float], preamp: Float, enabled: Bool) {
         for (i, g) in bands.prefix(eq.bands.count).enumerated() { eq.bands[i].gain = g }
         eq.globalGain = preamp
-        eq.bypass = !enabled
+        // すべて 0dB のときは通さない (通すだけでも計算の丸めが入り、元の音と 1 ビット単位では一致しなくなる)
+        eq.bypass = !enabled || (preamp == 0 && bands.allSatisfy { $0 == 0 })
     }
 
     func setOutputDevice(_ id: AudioDeviceID?) {
@@ -419,10 +729,17 @@ final class AudioEngine {
         engine.stop()
         AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0,
                              &device, UInt32(MemoryLayout<AudioDeviceID>.size))
+        selectedDevice = id
+        let rate = deviceSampleRate
+        if rate > 0 { rebuildChain(sampleRate: rate) }
         if wasRunning { startEngine() }
     }
 
     // MARK: - 内部
+
+    private func publishEQ() {
+        asmrShared.publishEQ(eqProfile.map { EQDesign.stages(for: $0, sampleRate: chainSampleRate) } ?? [])
+    }
 
     private func publishASMR() {
         var s = asmrSettings
@@ -472,7 +789,15 @@ final class AudioEngine {
 
     private func startEngine() {
         guard !engine.isRunning else { return }
-        do { try engine.start() } catch { NSLog("Kanade: engine start failed: \(error)") }
+        do {
+            try engine.start()
+        } catch {
+            NSLog("Kanade: engine start failed: \(error)")
+            // 再生中の表示のまま固まらないよう、止めて知らせる
+            isPlaying = false
+            stopTimer()
+            onStartFailure?()
+        }
     }
 
     private func applyVolume() {
@@ -493,6 +818,14 @@ final class AudioEngine {
             timePitch.pitch = pitch * 100
             timePitch.bypass = pitch == 0
         }
+        // 使う部品だけを経路に入れる。入れ替えたら、再生中の曲は同じ位置から読み込み直す
+        let needsTimePitch = !timePitch.bypass, needsVarispeed = !varispeed.bypass
+        guard needsTimePitch != timePitchInChain || needsVarispeed != varispeedInChain else { return }
+        timePitchInChain = needsTimePitch
+        varispeedInChain = needsVarispeed
+        let position = self.position, playing = isPlaying, item = current
+        reconnectChain(sampleRate: chainSampleRate)
+        if let item { load(item, at: position, play: playing) }
     }
 
     private func connect(_ deck: Deck, format: AVAudioFormat) {
@@ -522,6 +855,7 @@ final class AudioEngine {
     }
 
     private func tick() {
+        if !offline { watchForStall() }
         let deck = activeDeck
         guard let (index, seg, pos) = deck.status() else { return }
         if let target = pendingSeek {
@@ -559,7 +893,7 @@ final class AudioEngine {
         let remaining = (duration - pos) / Double(max(rate, 0.1))
         let isLast = index == deck.segments.count - 1
         if isLast, upcoming == nil, crossfade == nil, remaining < max(3, crossfadeDuration + 1.5),
-           let next = provideNext?() {
+           let next = provideNext?(), canContinue(to: next) {
             let xf = crossfadeDuration > 0.05 && !next.continues(seg.item)
                 && duration > crossfadeDuration * 2 && next.duration > crossfadeDuration * 2
             if xf {

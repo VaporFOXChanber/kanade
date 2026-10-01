@@ -48,6 +48,7 @@ struct NowPlayingView: View {
                     .padding(.trailing, 4)
             }
             SkinMenu()
+            IconButton(symbol: "books.vertical", size: 14, help: "ライブラリ (⌥⌘L)") { openWindow(id: "library") }
             IconButton(symbol: "plus", size: 14, help: "ファイル・フォルダを開く (⌘O)") { presentOpenPanel() }
             IconButton(symbol: "pip.enter", size: 14, help: "ミニプレイヤー (⌥⌘M)") { openWindow(id: "mini") }
         }
@@ -161,6 +162,10 @@ struct TrackInfo: View {
             }
             if t.isCueTrack { Badge(text: "CUE") }
             if model.asmrMode { Badge(text: model.swapChannels ? "ASMR · L⇄R" : "ASMR", highlight: model.palette.accent) }
+            if model.signalPath?.quality == .bitPerfect {
+                Badge(text: "ビットパーフェクト", highlight: model.palette.accent)
+                    .help("元のデータを 1 ビットも変えずに出力しています（⌥⌘E の「出力」で道筋を確認できます）")
+            }
         }
     }
 }
@@ -169,11 +174,16 @@ struct TrackInfo: View {
 
 struct TransportControls: View {
     @Environment(PlayerModel.self) private var model
+    @State private var showInfo = false
 
     var body: some View {
         let accent = model.palette.accent
         GlassEffectContainer(spacing: 20) {
             HStack(spacing: 22) {
+                IconButton(symbol: model.isCurrentFavorite ? "heart.fill" : "heart", size: 15, active: model.isCurrentFavorite, tint: accent,
+                           help: model.isCurrentFavorite ? "お気に入りから外す (⌘⇧F)" : "お気に入りに追加 (⌘⇧F)") {
+                    model.toggleFavorite()
+                }
                 IconButton(symbol: "shuffle", size: 15, active: model.shuffle, tint: accent, help: "シャッフル") {
                     model.shuffle.toggle()
                 }
@@ -204,6 +214,11 @@ struct TransportControls: View {
                            help: ["off": "リピート: オフ", "all": "リピート: すべて", "one": "リピート: 1曲"][model.repeatMode.rawValue]!) {
                     model.repeatMode = model.repeatMode.next
                 }
+                IconButton(symbol: "info.circle", size: 15, active: showInfo, tint: accent, help: "曲の情報 (⌘I)") { showInfo.toggle() }
+                    .popover(isPresented: $showInfo, arrowEdge: .top) {
+                        if let t = model.currentTrack { TrackInspector(track: t).environment(model) }
+                    }
+                    .onReceive(NotificationCenter.default.publisher(for: .kanadeShowInfo)) { _ in showInfo = true }
             }
         }
     }
@@ -486,4 +501,5 @@ func presentOpenPanel() {
 extension Notification.Name {
     static let kanadeShowSound = Notification.Name("kanadeShowSound")
     static let kanadeShowASMR = Notification.Name("kanadeShowASMR")
+    static let kanadeShowInfo = Notification.Name("kanadeShowInfo")
 }

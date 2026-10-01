@@ -87,10 +87,37 @@ private struct SoundTab: View {
                 Picker("", selection: $m.asmrStrength) {
                     ForEach(ASMRStrength.allCases) { Text($0.label).tag($0) }
                 }
-                .pickerStyle(.segmented).labelsHidden().frame(width: 210)
+                .pickerStyle(.segmented).labelsHidden().frame(width: 290)
                 .accessibilityLabel("音量のならし")
             }
+            if model.asmrStrength == .custom { CustomCurveEditor() }
             DynamicsMeters(accent: accent)
+            HStack {
+                Text("処理前の音と聴き比べる").font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Text(model.asmrCompare ? "処理前の音" : "押している間だけ")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(model.asmrCompare ? .black.opacity(0.8) : .white.opacity(0.85))
+                    .padding(.horizontal, 12).padding(.vertical, 5)
+                    .background(Capsule().fill(model.asmrCompare ? accent : .white.opacity(0.12)))
+                    .contentShape(Capsule())
+                    .onLongPressGesture(minimumDuration: 0, maximumDistance: 60, perform: {}, onPressingChanged: { model.asmrCompare = $0 })
+                    .help("押している間、音量のならし・ラウドネス補正などを外した音になります（左右の入れ替えとリミッターは残ります）")
+                    .accessibilityLabel("処理前の音と聴き比べる")
+                    .accessibilityAddTraits(.isButton)
+            }
+            .padding(.leading, 26)
+
+            row("低い雑音をカット", "waveform.path.badge.minus") {
+                Picker("", selection: $m.asmrLowCut) {
+                    Text("オフ").tag(0.0)
+                    Text("40Hz").tag(40.0)
+                    Text("80Hz").tag(80.0)
+                }
+                .pickerStyle(.segmented).labelsHidden().frame(width: 180)
+                .accessibilityLabel("低い雑音をカット")
+            }
+            caption("マイクに触れる音や空調・風のような、ごく低い雑音を切ります。小さい音を持ち上げたときに、低いうなりまで大きくなるのを防げます。")
 
             row("高音の刺さりをやわらげる", "waveform.badge.minus") {
                 Picker("", selection: $m.asmrSoftening) {
@@ -133,6 +160,34 @@ private struct SoundTab: View {
     }
 }
 
+/// 「カスタム」の強さの値を決める
+private struct CustomCurveEditor: View {
+    @Environment(PlayerModel.self) private var model
+
+    var body: some View {
+        @Bindable var m = model
+        Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 6) {
+            slider("持ち上げ始め", $m.asmrCustom.upThreshold, -45 ... -20, "%.0f dB", "これより小さい音を持ち上げます")
+            slider("持ち上げの上限", $m.asmrCustom.maxBoost, 0...18, "+%.0f dB", "持ち上げる量の上限")
+            slider("抑え始め", $m.asmrCustom.downThreshold, -30 ... -6, "%.0f dB", "これより大きい音を抑えます")
+            slider("抑えの比率", $m.asmrCustom.downRatio, 1.5...8, "%.1f : 1", "超えた分をこの比率で小さくします")
+        }
+        .font(.caption)
+        .padding(.leading, 26)
+    }
+
+    private func slider(_ title: String, _ value: Binding<Float>, _ range: ClosedRange<Float>, _ format: String, _ help: String) -> some View {
+        GridRow {
+            Text(title).foregroundStyle(.secondary)
+            Slider(value: value, in: range, step: range.upperBound <= 8 ? 0.5 : 1)
+                .controlSize(.small)
+                .accessibilityLabel(title)
+            Text(String(format: format, value.wrappedValue)).monospacedDigit().frame(width: 58, alignment: .trailing)
+        }
+        .help(help)
+    }
+}
+
 /// 今どれだけ持ち上げ・抑えているか (再生中だけ 4 回/秒で更新)
 private struct DynamicsMeters: View {
     @Environment(PlayerModel.self) private var model
@@ -142,13 +197,18 @@ private struct DynamicsMeters: View {
         if model.asmrMode, model.isPlaying {
             TimelineView(.periodic(from: .now, by: 0.25)) { _ in
                 let m = model.engine.asmrMeters
-                HStack(spacing: 14) {
-                    meter("持ち上げ", m.boost, range: 14, color: accent)
-                    meter("抑え", m.cut, range: 20, color: .orange)
-                    meter("リミッター", m.limit, range: 12, color: .red)
-                    if model.asmrSoftening != .off {
-                        meter("高音", m.soften, range: 9, color: .teal)
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 14) {
+                        meter("持ち上げ", m.boost, range: 18, color: accent)
+                        meter("抑え", m.cut, range: 20, color: .orange)
+                        meter("リミッター", m.limit, range: 12, color: .red)
+                        if model.asmrSoftening != .off {
+                            meter("高音", m.soften, range: 9, color: .teal)
+                        }
                     }
+                    Text(m.input < -90 ? "入力 —  →  出力 —" : String(format: "入力 %.0f dB  →  出力 %.0f dB", m.input, m.output))
+                        .font(.system(size: 10.5).monospacedDigit())
+                        .foregroundStyle(.secondary)
                 }
             }
             .padding(.leading, 26)

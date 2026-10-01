@@ -17,6 +17,13 @@ struct KanadeApp: App {
         .defaultSize(width: 1160, height: 780)
         .commands { PlayerCommands(model: model) }
 
+        Window("ライブラリ", id: "library") {
+            LibraryView()
+                .environment(model)
+                .frame(minWidth: 760, minHeight: 480)
+        }
+        .defaultSize(width: 1000, height: 660)
+
         Window("ミニプレイヤー", id: "mini") {
             MiniPlayerView().environment(model)
         }
@@ -42,6 +49,10 @@ struct PlayerCommands: Commands {
             Divider()
             Button("この作品のアートワークを選ぶ…") { model.chooseArtwork() }.disabled(model.currentTrack == nil)
             Button("アートワークを元に戻す") { model.clearCustomArtwork() }.disabled(!model.hasCustomArtwork)
+            Divider()
+            Button("曲の情報") { NotificationCenter.default.post(name: .kanadeShowInfo, object: nil) }
+                .keyboardShortcut("i").disabled(model.currentTrack == nil)
+            Button("再生キューをプレイリストとして保存") { model.saveQueueAsPlaylist() }.disabled(model.queue.isEmpty)
         }
         CommandMenu("再生") {
             Button("再生 / 一時停止") { model.togglePlay() }
@@ -55,10 +66,16 @@ struct PlayerCommands: Commands {
             Button("音量を下げる") { model.volume = max(0, model.volume - 0.05) }.keyboardShortcut(.downArrow, modifiers: .command)
             Button("消音") { model.muted.toggle() }
             Divider()
+            Button("速度を上げる") { model.changeRate(by: 0.05) }.keyboardShortcut("=", modifiers: .command).disabled(model.asmrMode)
+            Button("速度を下げる") { model.changeRate(by: -0.05) }.keyboardShortcut("-", modifiers: .command).disabled(model.asmrMode)
+            Button("等速に戻す") { model.rate = 1 }.keyboardShortcut("0", modifiers: .command).disabled(model.asmrMode || model.rate == 1)
+            Divider()
             Button("シャッフル") { model.shuffle.toggle() }.keyboardShortcut("s")
             Button("リピートを切り替え") { model.repeatMode = model.repeatMode.next }.keyboardShortcut("r")
             Button("A-B リピート") { model.toggleABLoop() }.keyboardShortcut("b")
             Divider()
+            Button(model.isCurrentFavorite ? "お気に入りから外す" : "お気に入りに追加") { model.toggleFavorite() }
+                .keyboardShortcut("f", modifiers: [.command, .shift]).disabled(model.currentTrack == nil)
             Button("しおりをはさむ") { model.addBookmark() }.keyboardShortcut("d")
             Button("前のしおりへ") { model.previousBookmark() }.keyboardShortcut("[")
             Button("次のしおりへ") { model.nextBookmark() }.keyboardShortcut("]")
@@ -73,6 +90,10 @@ struct PlayerCommands: Commands {
             Toggle("省電力表示 (ASMR)", isOn: Binding(get: { model.lowPowerDisplay }, set: { model.lowPowerDisplay = $0 }))
                 .disabled(!model.asmrMode)
             Button("左右を確認 (ASMR)") { model.playChannelCheck() }.disabled(!model.asmrMode)
+            Divider()
+            Toggle("排他モード", isOn: Binding(get: { model.exclusiveMode }, set: { model.exclusiveMode = $0 }))
+                .disabled(model.switchingExclusive)
+            Toggle("デバイスのサンプルレートを曲に合わせる", isOn: Binding(get: { model.matchSampleRate }, set: { model.matchSampleRate = $0 }))
         }
         CommandGroup(before: .toolbar) {
             Button("歌詞を表示 / 隠す") { withAnimation { model.showLyrics.toggle() } }.keyboardShortcut("l")
@@ -82,6 +103,7 @@ struct PlayerCommands: Commands {
             Button("イコライザー・音響効果…") { NotificationCenter.default.post(name: .kanadeShowSound, object: nil) }
                 .keyboardShortcut("e", modifiers: [.command, .option])
             Button("ミニプレイヤー") { openWindow(id: "mini") }.keyboardShortcut("m", modifiers: [.command, .option])
+            Button("ライブラリ") { openWindow(id: "library") }.keyboardShortcut("l", modifiers: [.command, .option])
             Divider()
         }
     }
@@ -123,11 +145,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 case "m": model.muted.toggle(); return nil
                 case "[", "]":
                     // ASMR モード中は等速のまま
-                    if model.asmrMode {
-                        model.showToast("ASMR モード中は速度を変えられません", symbol: "ear")
-                    } else {
-                        model.rate = c == "[" ? max(0.5, model.rate - 0.05) : min(2, model.rate + 0.05)
-                    }
+                    model.changeRate(by: c == "[" ? -0.05 : 0.05)
                     return nil
                 default: break
                 }
@@ -135,8 +153,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return event
         }
 
+        // 開発用: 画面を画像に書き出して終了する (確認用のビルドだけ)
+        let snapshot = DevSnapshot.directory
+        if let snapshot { Task { await DevSnapshot.run(into: snapshot) } }
+
         // コマンドライン引数で渡されたファイル (open -a Kanade --args ...)
-        let paths = CommandLine.arguments.dropFirst().filter { !$0.hasPrefix("-") && FileManager.default.fileExists(atPath: $0) }
+        let paths = CommandLine.arguments.dropFirst().filter {
+            !$0.hasPrefix("-") && $0 != snapshot?.path && FileManager.default.fileExists(atPath: $0)
+        }
         if !paths.isEmpty { model.open(paths.map { URL(fileURLWithPath: $0) }) }
 
         // 引数やファイル付きで起動されると SwiftUI がメインウィンドウを開かないことがあるので保険
@@ -165,5 +189,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         PlayerModel.shared.saveNow()
+        // 切り替えた出力デバイスのサンプルレートと排他モードを元に戻す
+        PlayerModel.shared.engine.restoreOutputDevice(releaseExclusive: true)
     }
 }
