@@ -1,0 +1,250 @@
+import AVFoundation
+import Testing
+@testable import Kanade
+
+/// 再生エンジンを音を出さない設定で動かし、出てくる波形を集める。
+/// エンジン内の待ち時間 (フェードが終わるのを待つなど) は、描画したサンプル数から決まる仮の時計で進める
+/// (実時間に頼ると、テストを並列に回したときに描画が遅れて結果がぶれる)
+@MainActor
+private final class OfflineRig {
+    static let sampleRate = 48000.0
+    static let amplitude: Float = 0.2
+    static let frequency = 1000.0
+
+    let audio: AudioEngine
+    let item: PlaybackItem
+    private let chunk: AVAudioPCMBuffer
+    private let fileURL: URL
+    private var scheduled: [(due: Int, order: Int, work: () -> Void)] = []
+    private var order = 0
+    private(set) var left: [Float] = []
+    /// 実際に描画したサンプルの数 (エンジンが止まっている間は 0 を足すだけ)
+    private(set) var renderedFrames = 0
+
+    init() throws {
+        let format = try #require(AVAudioFormat(standardFormatWithSampleRate: Self.sampleRate, channels: 2))
+        audio = AudioEngine(offlineFormat: format)
+        audio.volume = 1
+        chunk = try #require(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 4096))
+
+        // 1kHz の正弦波 8 秒のファイル
+        fileURL = FileManager.default.temporaryDirectory.appendingPathComponent("kanade-test-\(UUID().uuidString).caf")
+        let count = AVAudioFrameCount(8 * Self.sampleRate)
+        let buffer = try #require(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: count))
+        buffer.frameLength = count
+        for i in 0..<Int(count) {
+            let v = Self.amplitude * Float(sin(2 * Double.pi * Self.frequency * Double(i) / Self.sampleRate))
+            buffer.floatChannelData![0][i] = v
+            buffer.floatChannelData![1][i] = v
+        }
+        do {
+            let writer = try AVAudioFile(forWriting: fileURL, settings: format.settings)
+            try writer.write(from: buffer)
+            writer.close()
+        }
+        item = PlaybackItem(trackID: UUID(), file: try AVAudioFile(forReading: fileURL), source: fileURL, start: 0, end: nil, gain: 1)
+        audio.after = { [unowned self] seconds, work in
+            self.order += 1
+            self.scheduled.append((self.left.count + Int(seconds * Self.sampleRate), self.order, work))
+        }
+    }
+
+    deinit { try? FileManager.default.removeItem(at: fileURL) }
+
+    /// seconds だけ進め、その間の出力を集める。予約された処理は、その時刻まで描画したところで実行する
+    func run(_ seconds: Double) throws {
+        let end = left.count + Int(seconds * Self.sampleRate)
+        while true {
+            let next = scheduled.filter { $0.due <= end }.min { ($0.due, $0.order) < ($1.due, $1.order) }
+            try render(until: min(end, next?.due ?? end))
+            guard let next else { break }
+            scheduled.removeAll { $0.order == next.order }
+            next.work()
+        }
+    }
+
+    private func render(until target: Int) throws {
+        while left.count < target {
+            let frames = min(256, target - left.count)
+            if audio.engine.isRunning {
+                let status = try audio.engine.renderOffline(AVAudioFrameCount(frames), to: chunk)
+                #expect(status == .success)
+                left += UnsafeBufferPointer(start: chunk.floatChannelData![0], count: Int(chunk.frameLength))
+                renderedFrames = left.count
+            } else {
+                left += [Float](repeating: 0, count: frames)
+            }
+        }
+    }
+
+    /// 落ち着いて鳴っているときの大きさ (dB) と、隣り合うサンプルの差の最大
+    var steadyDB: Float { 20 * log10(Self.amplitude / Float(2).squareRoot()) }
+    var steadyStep: Float { Self.amplitude * Float(2 * Double.pi * Self.frequency / Self.sampleRate) }
+
+    func level(_ range: Range<Int>) -> Float { rmsDB(left, range) - steadyDB }
+
+    func steepest(_ range: Range<Int>) -> Float {
+        var m: Float = 0
+        for i in range where i > 0 { m = max(m, abs(left[i] - left[i - 1])) }
+        return m
+    }
+
+    func frames(_ seconds: Double) -> Int { Int(seconds * Self.sampleRate) }
+}
+
+@Suite("再生エンジンのつなぎ目", .serialized)
+@MainActor
+struct AudioEngineTests {
+    @Test("ASMR モードの一時停止は、音を絞りきってから止まる (プツッと切らない)")
+    func softPauseFadesOut() throws {
+        let rig = try OfflineRig()
+        rig.audio.softTransitions = true
+        rig.audio.load(rig.item, play: true)
+        try rig.run(0.5)
+        let pausedAt = rig.left.count
+        #expect(abs(rig.level((pausedAt - 4800)..<pausedAt)) < 0.2)
+
+        rig.audio.pause()
+        #expect(!rig.audio.isPlaying)                       // 表示上はすぐ止まる
+        #expect(rig.audio.engine.isRunning)                 // 音はフェードが終わるまで出し続ける
+        try rig.run(0.4)
+        #expect(!rig.audio.engine.isRunning)
+        let stoppedAt = rig.renderedFrames
+        #expect(stoppedAt > pausedAt + rig.frames(0.1))
+        #expect(rig.level((stoppedAt - 240)..<stoppedAt) < -30)                        // 止まる直前は十分小さい
+        #expect(rig.steepest((pausedAt - 480)..<rig.left.count) <= rig.steadyStep * 1.02)  // 段差がない
+        let position = rig.audio.position
+        #expect((0.5...0.75).contains(position), "止まった位置 \(position)")
+    }
+
+    @Test("ASMR モードの再開は、無音からフェードインする")
+    func softResumeFadesIn() throws {
+        let rig = try OfflineRig()
+        rig.audio.softTransitions = true
+        rig.audio.load(rig.item, play: true)
+        try rig.run(0.4)
+        rig.audio.pause()
+        try rig.run(0.4)
+
+        let resumedAt = rig.left.count
+        rig.audio.play()
+        #expect(rig.audio.isPlaying)
+        try rig.run(0.7)
+        #expect(rig.level(resumedAt..<(resumedAt + rig.frames(0.03))) < -40)            // 出だしは無音
+        let rising = rig.level((resumedAt + rig.frames(0.07))..<(resumedAt + rig.frames(0.08)))
+        #expect((-20.0 ... -6.0).contains(rising), "0.07 秒後の大きさ \(rising) dB")      // 上がっていく途中
+        #expect(abs(rig.level((rig.left.count - 4800)..<rig.left.count)) < 0.2)        // 元の大きさに戻る
+        #expect(rig.steepest(resumedAt..<rig.left.count) <= rig.steadyStep * 1.02)
+    }
+
+    @Test("フェードアウトの途中で再生し直すと、止まらずに音が戻る")
+    func playDuringFadeOutKeepsRunning() throws {
+        let rig = try OfflineRig()
+        rig.audio.softTransitions = true
+        rig.audio.load(rig.item, play: true)
+        try rig.run(0.4)
+        rig.audio.pause()
+        try rig.run(0.05)
+        rig.audio.play()
+        try rig.run(0.6)
+        #expect(rig.audio.isPlaying)
+        #expect(rig.audio.engine.isRunning)
+        #expect(abs(rig.level((rig.left.count - 4800)..<rig.left.count)) < 0.2)
+        #expect(rig.steepest(4800..<rig.left.count) <= rig.steadyStep * 1.02)
+    }
+
+    @Test("ASMR モードのシークは、一瞬絞ってから移動する")
+    func softSeekDipsThroughSilence() throws {
+        let rig = try OfflineRig()
+        rig.audio.softTransitions = true
+        rig.audio.load(rig.item, play: true)
+        try rig.run(0.5)
+        let seekAt = rig.left.count
+        rig.audio.seek(to: 3.01234)                          // 波形の位相がずれる位置へ
+        #expect(abs(rig.audio.position - 3.01234) < 0.001)   // 行き先はすぐ反映される
+        try rig.run(0.6)
+
+        var quietest: Float = 0
+        for start in stride(from: seekAt, to: seekAt + rig.frames(0.2), by: 48) {
+            quietest = min(quietest, rig.level(start..<(start + 96)))
+        }
+        #expect(quietest < -30, "移動の前後の最小 \(quietest) dB")
+        #expect(abs(rig.level((rig.left.count - 4800)..<rig.left.count)) < 0.2)
+        #expect(rig.steepest(seekAt..<rig.left.count) <= rig.steadyStep * 1.02)
+        let position = rig.audio.position
+        #expect((3.3...3.75).contains(position), "移動後の位置 \(position)")
+    }
+
+    @Test("続けてシークしても、最後の行き先に落ち着く")
+    func repeatedSeeksLandOnLastTarget() throws {
+        let rig = try OfflineRig()
+        rig.audio.softTransitions = true
+        rig.audio.load(rig.item, play: true)
+        try rig.run(0.3)
+        for step in 1...5 {
+            rig.audio.seek(to: Double(step))
+            try rig.run(0.012)
+        }
+        try rig.run(0.5)
+        let position = rig.audio.position
+        #expect((5.3...5.8).contains(position), "位置 \(position)")
+        #expect(abs(rig.level((rig.left.count - 4800)..<rig.left.count)) < 0.2)
+    }
+
+    @Test("ASMR モードで曲の途中から再生を始めると、フェードインする")
+    func softStartFromMiddle() throws {
+        let rig = try OfflineRig()
+        rig.audio.softTransitions = true
+        rig.audio.load(rig.item, at: 2.00037, play: true)
+        try rig.run(0.7)
+        #expect(rig.level(0..<rig.frames(0.03)) < -40)
+        #expect(abs(rig.level((rig.left.count - 4800)..<rig.left.count)) < 0.2)
+        #expect(rig.steepest(1..<rig.left.count) <= rig.steadyStep * 1.02)
+    }
+
+    @Test("曲の頭からの再生は、フェードをかけずにそのまま鳴らす")
+    func startFromBeginningIsNotFaded() throws {
+        let rig = try OfflineRig()
+        rig.audio.softTransitions = true
+        rig.audio.load(rig.item, play: true)
+        try rig.run(0.3)
+        #expect(abs(rig.level(rig.frames(0.01)..<rig.frames(0.03))) < 0.2)
+    }
+
+    @Test("ASMR モードでなければ、一時停止もシークもこれまでどおりすぐに行う")
+    func normalModeIsImmediate() throws {
+        let rig = try OfflineRig()
+        rig.audio.load(rig.item, play: true)
+        try rig.run(0.3)
+        rig.audio.seek(to: 4)
+        try rig.run(0.2)
+        #expect(abs(rig.level((rig.left.count - 2400)..<rig.left.count)) < 0.2)
+        #expect((4.1...4.4).contains(rig.audio.position))
+        rig.audio.pause()
+        #expect(!rig.audio.engine.isRunning)
+        rig.audio.play()
+        try rig.run(0.2)
+        #expect(abs(rig.level((rig.left.count - 2400)..<rig.left.count)) < 0.2)
+    }
+}
+
+@Suite("左右の確認音")
+struct ChannelCheckTests {
+    @Test("左で 1 回、そのあと右で 2 回鳴る")
+    func leftThenRight() {
+        let (left, right) = ChannelCheck.samples()
+        let rate = ChannelCheck.sampleRate
+        func frames(_ seconds: Double) -> Int { Int(seconds * rate) }
+        // 前半は左だけ、後半は右だけ
+        #expect(peak(left, 0..<frames(0.6)) > 0.05)
+        #expect(peak(right, 0..<frames(0.8)) == 0)
+        #expect(peak(left, frames(0.6)..<left.count) == 0)
+        #expect(peak(right, frames(0.86)..<frames(1.0)) > 0.05)
+        #expect(peak(right, frames(1.21)..<frames(1.4)) > 0.05)
+        // 大きすぎず、始まりと終わりは無音
+        #expect(max(peak(left, 0..<left.count), peak(right, 0..<right.count)) <= ChannelCheck.level)
+        #expect(left.first == 0 && right.last == 0)
+        // 右の 2 回の間は、いったん小さくなる
+        #expect(peak(right, frames(1.15)..<frames(1.2)) < 0.02)
+    }
+}

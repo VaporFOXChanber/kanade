@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+<!-- アンプの音量ノブ。角丸と縁の光沢は macOS が付けるので、ここでは正方形いっぱいに描く -->
+<defs>
+<linearGradient id="bbg" x1="0" y1="0" x2="0" y2="1">
+<stop offset="0" stop-color="#34363E"/>
+<stop offset="1" stop-color="#101115"/>
+</linearGradient>
+<radialGradient id="bglow" cx=".5" cy=".53" r=".5">
+<stop offset=".55" stop-color="#FFA63D" stop-opacity=".28"/>
+<stop offset="1" stop-color="#FFA63D" stop-opacity="0"/>
+</radialGradient>
+<linearGradient id="brim" x1="0" y1="0" x2="0" y2="1">
+<stop offset="0" stop-color="#F4F5F7"/>
+<stop offset=".5" stop-color="#9AA0AA"/>
+<stop offset="1" stop-color="#4A4E57"/>
+</linearGradient>
+<linearGradient id="bcap" x1="0" y1="0" x2="0" y2="1">
+<stop offset="0" stop-color="#5A5E68"/>
+<stop offset="1" stop-color="#23252B"/>
+</linearGradient>
+<linearGradient id="bsheen" x1="0" y1="0" x2="1" y2="1">
+<stop offset=".2" stop-color="#fff" stop-opacity=".22"/>
+<stop offset=".5" stop-color="#fff" stop-opacity="0"/>
+<stop offset=".85" stop-color="#fff" stop-opacity=".08"/>
+</linearGradient>
+<filter id="bds" x="-30%" y="-30%" width="160%" height="170%">
+<feDropShadow dx="0" dy="26" stdDeviation="26" flood-color="#000" flood-opacity=".6"/>
+</filter>
+<filter id="bbl" x="-50%" y="-50%" width="200%" height="200%">
+<feGaussianBlur stdDeviation="9"/>
+</filter>
+</defs>
+<rect width="1024" height="1024" fill="url(#bbg)"/>
+<g transform="translate(512 512) scale(1.2) translate(-512 -530)">
+<circle cx="512" cy="540" r="470" fill="url(#bglow)"/>
+<g id="btk">
+<g stroke-linecap="round" fill="none">
+<path d="M263 789L226 826M160 540L108 540M263 291L226 254M512 188L512 136M761 291L798 254" stroke="#FFB347" stroke-opacity="1" stroke-width="12"/>
+<path d="M227 747L198 768M198 700L166 716M177 649L143 660M164 595L129 601M164 485L129 479M177 431L143 420M198 380L166 364M227 333L198 312M305 255L284 226M352 226L336 194M403 205L392 171M457 192L451 157M567 192L573 157M621 205L632 171M672 226L688 194M719 255L740 226" stroke="#FFB347" stroke-opacity="1" stroke-width="8"/>
+<path d="M797 333L826 312M826 380L858 364M847 431L881 420M860 485L895 479M860 595L895 601M847 649L881 660M826 700L858 716M797 747L826 768" stroke="#fff" stroke-opacity=".22" stroke-width="8"/>
+<path d="M864 540L916 540M761 789L798 826" stroke="#fff" stroke-opacity=".22" stroke-width="12"/>
+</g>
+</g>
+<circle cx="512" cy="540" r="296" fill="url(#brim)" filter="url(#bds)"/>
+<circle cx="512" cy="540" r="268" fill="url(#bcap)"/>
+<g fill="none" stroke="#fff" stroke-opacity=".05" stroke-width="2">
+<circle cx="512" cy="540" r="48"/>
+<circle cx="512" cy="540" r="70"/>
+<circle cx="512" cy="540" r="92"/>
+<circle cx="512" cy="540" r="114"/>
+<circle cx="512" cy="540" r="136"/>
+<circle cx="512" cy="540" r="158"/>
+<circle cx="512" cy="540" r="180"/>
+<circle cx="512" cy="540" r="202"/>
+<circle cx="512" cy="540" r="224"/>
+<circle cx="512" cy="540" r="246"/>
+</g>
+<circle cx="512" cy="540" r="268" fill="url(#bsheen)"/>
+<circle cx="512" cy="540" r="268" fill="none" stroke="#000" stroke-opacity=".35" stroke-width="4"/>
+<line x1="602" y1="461" x2="686" y2="387" stroke="#FFB347" stroke-width="30" stroke-linecap="round" filter="url(#bbl)" opacity=".8"/>
+<line x1="602" y1="461" x2="686" y2="387" stroke="#FFC56B" stroke-width="22" stroke-linecap="round"/>
+</g>
+</svg>

@@ -1,0 +1,6 @@
+.build/
+build/
+Kanade.app/
+.DS_Store
+.swiftpm/
+Kanade Dev.app/

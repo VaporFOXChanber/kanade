@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>Kanade</string>
+	<key>CFBundleDisplayName</key>
+	<string>Kanade</string>
+	<key>CFBundleIdentifier</key>
+	<string>app.kanade.player</string>
+	<key>CFBundleExecutable</key>
+	<string>Kanade</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>ja</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>26.0</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.music</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>奏 Kanade</string>
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Audio</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>public.audio</string>
+				<string>public.movie</string>
+				<string>public.folder</string>
+				<string>public.m3u-playlist</string>
+			</array>
+		</dict>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Other Audio</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>CFBundleTypeExtensions</key>
+			<array>
+				<string>ape</string>
+				<string>wv</string>
+				<string>tta</string>
+				<string>tak</string>
+				<string>dsf</string>
+				<string>dff</string>
+				<string>mka</string>
+				<string>wma</string>
+				<string>opus</string>
+				<string>ogg</string>
+				<string>oga</string>
+				<string>flac</string>
+				<string>mpc</string>
+				<string>dts</string>
+				<string>ac3</string>
+				<string>cue</string>
+				<string>m3u</string>
+				<string>m3u8</string>
+				<string>pls</string>
+				<string>webm</string>
+				<string>mkv</string>
+			</array>
+		</dict>
+	</array>
+</dict>
+</plist>
