@@ -107,20 +107,108 @@ struct LibraryTests {
         #expect(library.added.count == 1)
     }
 
+    @Test("フォルダだけでなく、ファイル単体も登録できる。登録済みのフォルダの中のファイルは足さない")
+    func addsSingleFiles() {
+        var library = LibraryData()
+        let folder = URL(fileURLWithPath: "/m/album", isDirectory: true)
+        #expect(library.addSources([folder, URL(fileURLWithPath: "/single/one.flac")]) == 2)
+        // 同じもの、登録済みのフォルダの中にあるものは足さない
+        #expect(library.addSources([URL(fileURLWithPath: "/single/one.flac"), URL(fileURLWithPath: "/m/album/disc1/01.flac"),
+                                    URL(fileURLWithPath: "/m/album")]) == 0)
+        // 名前の前半が同じだけの別のフォルダは、中にあるものとは見なさない
+        #expect(library.addSources([URL(fileURLWithPath: "/m/album2/01.flac")]) == 1)
+        #expect(library.sources.map(\.path) == ["/m/album", "/single/one.flac", "/m/album2/01.flac"])
+    }
+
+    @Test("フォルダを登録すると、その中にあった単体のファイルの登録は、フォルダにまとめられる")
+    func folderAbsorbsFiles() {
+        var library = LibraryData()
+        library.addSources([URL(fileURLWithPath: "/m/album/01.flac"), URL(fileURLWithPath: "/m/album/02.flac"),
+                            URL(fileURLWithPath: "/other/x.mp3")])
+        #expect(library.addSources([URL(fileURLWithPath: "/m/album", isDirectory: true)]) == 1)
+        #expect(library.sources.map(\.path) == ["/other/x.mp3", "/m/album"])
+        library.removeSource(URL(fileURLWithPath: "/other/x.mp3"))
+        #expect(library.sources.map(\.path) == ["/m/album"])
+    }
+
+    @Test("あとから足した場所の曲は、今の曲に足される (前からある曲は読み込み済みのまま)")
+    func appendsScannedTracks() {
+        var library = LibraryData()
+        let first = Date(timeIntervalSince1970: 1000), second = Date(timeIntervalSince1970: 2000)
+        library.merge(scanned: [track("/m/a.mp3", title: "読み込み済み")], modified: ["/m/a.mp3": 1], now: first)
+        library.append(scanned: [track("/single/one.flac", loaded: false)], modified: ["/single/one.flac": 5], now: second)
+        #expect(library.tracks.map(\.fileName) == ["a.mp3", "one.flac"])
+        #expect(library.tracks.map(\.meta.loaded) == [true, false])
+        #expect(library.tracks[0].meta.title == "読み込み済み")
+        #expect(library.added[library.tracks[0].bookmarkKey] == first)
+        #expect(library.added[library.tracks[1].bookmarkKey] == second)
+        #expect(library.modified == ["/m/a.mp3": 1, "/single/one.flac": 5])
+        // 同じ曲をもう一度足しても、重ならない
+        library.append(scanned: [track("/single/one.flac", loaded: false)], modified: ["/single/one.flac": 5], now: second)
+        #expect(library.tracks.count == 2)
+    }
+
+    @Test("ライブラリに登録できるのは、フォルダ・音源・CUE シート・プレイリスト", arguments: [
+        ("/m/album", true, true), ("/m/a.flac", false, true), ("/m/a.MP3", false, true), ("/m/album.cue", false, true),
+        ("/m/list.m3u8", false, true), ("/m/cover.jpg", false, false), ("/m/readme.txt", false, false), ("/m/a.srt", false, false),
+    ])
+    func librarySources(path: String, isDirectory: Bool, expected: Bool) {
+        #expect(Importer.isLibrarySource(URL(fileURLWithPath: path), isDirectory: isDirectory) == expected)
+    }
+
+    @Test("単体のファイルを読み込むと、同じフォルダの歌詞とジャケットも拾う")
+    func singleFileImport() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("kanade-single-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        for name in ["01 one.flac", "01 one.lrc", "02 two.flac", "cover.jpg"] {
+            try Data().write(to: dir.appendingPathComponent(name))
+        }
+        let tracks = Importer.expand([dir.appendingPathComponent("01 one.flac")]).tracks
+        #expect(tracks.map(\.fileName) == ["01 one.flac"])          // 隣のファイルまでは読まない
+        #expect(tracks.first?.lyricsURL?.lastPathComponent == "01 one.lrc")
+        #expect(tracks.first?.folderArtURL?.lastPathComponent == "cover.jpg")
+    }
+
+    @Test("CUE シートで分けた曲をライブラリに入れるときは、CUE シートのほうを登録する")
+    func cueTrackSource() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("kanade-cue-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let media = dir.appendingPathComponent("album.flac")
+        try Data().write(to: media)
+        let cueTrack = Track(url: media, start: 60, end: 120)
+        // CUE シートのファイルがなければ (音源に埋め込まれている)、音源を登録する
+        #expect(Importer.librarySource(for: cueTrack) == media)
+        try Data().write(to: dir.appendingPathComponent("other.cue"))
+        try Data().write(to: dir.appendingPathComponent("album.cue"))
+        #expect(Importer.librarySource(for: cueTrack).lastPathComponent == "album.cue")   // 音源と同じ名前のものを優先
+        #expect(Importer.librarySource(for: Track(url: media)) == media)                   // ふつうの曲は、そのファイル
+    }
+
+    @Test("登録した場所は、これまでと同じ名前 (folders) で保存する")
+    func keepsStorageKey() throws {
+        var library = LibraryData()
+        library.sources = [URL(fileURLWithPath: "/m"), URL(fileURLWithPath: "/single/one.flac")]
+        let json = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(library)) as? [String: Any])
+        #expect((json["folders"] as? [Any])?.count == 2)
+        #expect(json["sources"] == nil)
+    }
+
     @Test("保存して読み直せる")
     func roundTrip() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("kanade-lib-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
         var library = LibraryData()
-        library.folders = [URL(fileURLWithPath: "/m")]
+        library.sources = [URL(fileURLWithPath: "/m"), URL(fileURLWithPath: "/single/one.flac")]
         library.merge(scanned: [track("/m/a.mp3", title: "A")], modified: ["/m/a.mp3": 1])
         library.playlists = [Playlist(name: "寝る前", tracks: library.tracks)]
         library.save(to: dir)
         let loaded = LibraryData.load(from: dir)
         #expect(loaded.tracks == library.tracks)
         #expect(loaded.playlists.map(\.name) == ["寝る前"])
-        #expect(loaded.folders == library.folders)
+        #expect(loaded.sources == library.sources)
     }
 }
 

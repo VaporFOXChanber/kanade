@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// ライブラリのウィンドウ: 登録したフォルダの曲を、アルバム・アーティスト・曲の一覧やプレイリストで見る
+/// ライブラリのウィンドウ: 登録したフォルダや単体で追加したファイルの曲を、アルバム・アーティスト・曲の一覧やプレイリストで見る
 struct LibraryView: View {
     @Environment(PlayerModel.self) private var model
     @State private var library = LibraryStore.shared
@@ -30,12 +30,7 @@ struct LibraryView: View {
         .preferredColorScheme(.dark)
         .tint(model.palette.accent)
         .foregroundStyle(.white)
-        .dropDestination(for: URL.self) { urls, _ in
-            let folders = urls.filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true }
-            guard !folders.isEmpty else { return false }
-            library.addFolders(folders)
-            return true
-        }
+        .dropDestination(for: URL.self) { urls, _ in library.addSources(urls) }
     }
 
     // MARK: サイドバー
@@ -73,25 +68,35 @@ struct LibraryView: View {
             if library.scanning {
                 HStack(spacing: 8) {
                     ProgressView().controlSize(.small)
-                    Text(library.progress.map { "タグを読み込み中 \($0.done) / \($0.total)" } ?? "フォルダを調べています…")
+                    Text(library.progress.map { "タグを読み込み中 \($0.done) / \($0.total)" } ?? "ファイルを調べています…")
                         .font(.caption).foregroundStyle(.white.opacity(0.6)).monospacedDigit()
                 }
                 .padding(.horizontal, 12)
             }
             HStack(spacing: 6) {
-                Button { chooseFolders() } label: { Label("フォルダを追加…", systemImage: "folder.badge.plus") }
+                Button { chooseSources() } label: { Label("追加…", systemImage: "plus") }
                     .controlSize(.small)
+                    .help("フォルダやファイルをライブラリに追加")
                 Menu {
-                    Button("調べ直す") { library.rescan() }.disabled(library.folders.isEmpty)
+                    Button("調べ直す") { library.rescan() }.disabled(library.sources.isEmpty)
                     if !library.folders.isEmpty {
                         Divider()
                         ForEach(library.folders, id: \.self) { folder in
-                            Button("「\(folder.lastPathComponent)」を外す") { library.removeFolder(folder) }
+                            Button("フォルダ「\(folder.lastPathComponent)」を外す") { library.removeSource(folder) }
+                        }
+                    }
+                    if !library.files.isEmpty {
+                        Divider()
+                        // 単体で追加したファイルは数が増えやすいので、ひとつ下のメニューにまとめる
+                        Menu("単体で追加したファイルを外す") {
+                            ForEach(library.files, id: \.self) { file in
+                                Button(file.lastPathComponent) { library.removeSource(file) }
+                            }
                         }
                     }
                 } label: { Image(systemName: "ellipsis.circle") }
                     .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
-                    .accessibilityLabel("ライブラリのフォルダ")
+                    .accessibilityLabel("ライブラリに登録した場所")
             }
             .padding(12)
         }
@@ -175,7 +180,7 @@ struct LibraryView: View {
 
     @ViewBuilder
     private var content: some View {
-        if library.folders.isEmpty, !section.isPlaylist {
+        if library.sources.isEmpty, !section.isPlaylist {
             emptyState
         } else if let id = openAlbum, let album = library.albums.first(where: { $0.id == id }) {
             AlbumDetail(album: album)
@@ -225,26 +230,26 @@ struct LibraryView: View {
         VStack(spacing: 14) {
             Image(systemName: "books.vertical").font(.system(size: 44, weight: .light))
             Text("ライブラリは空です").font(.title2.bold())
-            Text("音源の入ったフォルダを追加すると、中の曲をアルバムやアーティストごとに見られます。\nフォルダをこのウィンドウにドロップしても追加できます。ファイルは動かしません。")
+            Text("音源の入ったフォルダや、音源のファイルを追加すると、曲をアルバムやアーティストごとに見られます。\nフォルダやファイルをこのウィンドウにドロップしても追加できます。ファイルは動かしません。")
                 .multilineTextAlignment(.center).font(.callout).foregroundStyle(.white.opacity(0.6)).lineSpacing(3)
-            Button { chooseFolders() } label: { Label("フォルダを追加…", systemImage: "folder.badge.plus").padding(.horizontal, 6) }
+            Button { chooseSources() } label: { Label("フォルダやファイルを追加…", systemImage: "plus").padding(.horizontal, 6) }
                 .buttonStyle(.borderedProminent).controlSize(.large)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(40)
     }
 
-    private func chooseFolders() {
+    private func chooseSources() {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
-        panel.canChooseFiles = false
+        panel.canChooseFiles = true
         panel.allowsMultipleSelection = true
-        panel.message = "ライブラリに入れるフォルダを選んでください"
+        panel.message = "ライブラリに入れるフォルダやファイルを選んでください"
         panel.prompt = "追加"
         panel.begin { response in
             guard response == .OK else { return }
             let urls = panel.urls
-            Task { @MainActor in LibraryStore.shared.addFolders(urls) }
+            Task { @MainActor in LibraryStore.shared.addSources(urls) }
         }
     }
 }

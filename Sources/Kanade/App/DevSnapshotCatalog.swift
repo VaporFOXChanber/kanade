@@ -20,6 +20,13 @@ enum DevSnapshotCatalog {
                 }
             }, view: { AnyView(SoundPanel()) }))
         }
+        // ビットパーフェクト再生中の音響パネル (次の ASMR パネルで ASMR モードにすると、自動で解除される)
+        for name in ["output", "playback"] {
+            shots.append(DevSnapshotShot(name: "sound-\(name)-bitperfect", settle: 1500, prepare: {
+                tab("soundPanelTab", name)()
+                model.setBitPerfect(true)
+            }, view: { AnyView(SoundPanel()) }))
+        }
         // ASMR パネル
         for name in ["sound", "sleep", "position"] {
             shots.append(DevSnapshotShot(name: "asmr-\(name)", prepare: {
@@ -33,9 +40,13 @@ enum DevSnapshotCatalog {
         // ライブラリ (渡されたフォルダを登録してから撮る)
         let library = LibraryStore.shared
         let size = CGSize(width: 1000, height: 660)
+        // 先に 1 曲だけをファイル単体で登録して撮る (次でフォルダを登録すると、フォルダのほうにまとめられる)
+        shots.append(DevSnapshotShot(name: "library-single-file", size: size, settle: 2500, prepare: {
+            if let last = model.queue.last { library.addSources([Importer.librarySource(for: last)]) }
+        }, view: { AnyView(LibraryView(initial: .tracks)) }))
         shots.append(DevSnapshotShot(name: "library-albums", size: size, settle: 2500, prepare: {
             let folders = Set(model.queue.map { ArtworkFinder.workFolder(for: $0.url) })
-            library.addFolders(Array(folders))
+            library.addSources(Array(folders))
             if library.playlists.isEmpty, !model.queue.isEmpty { model.saveQueueAsPlaylist() }
             if let first = model.queue.first, !model.isFavorite(first) { model.toggleFavorite(first) }
         }, view: { AnyView(LibraryView()) }))

@@ -1,7 +1,7 @@
 import Foundation
 import Observation
 
-/// ライブラリ (登録したフォルダの中の曲) とプレイリストの管理
+/// ライブラリ (登録したフォルダの中の曲と、単体で追加したファイル) とプレイリストの管理
 @MainActor
 @Observable
 final class LibraryStore {
@@ -22,8 +22,17 @@ final class LibraryStore {
     }
 
     var tracks: [Track] { data.tracks }
-    var folders: [URL] { data.folders }
+    /// 登録した場所 (フォルダと、単体で追加したファイル)
+    var sources: [URL] { data.sources }
+    var folders: [URL] { data.sources.filter(isFolder) }
+    /// 単体で追加したファイル
+    var files: [URL] { data.sources.filter { !isFolder($0) } }
     var playlists: [Playlist] { data.playlists }
+
+    private func isFolder(_ url: URL) -> Bool {
+        // ドライブを外しているときなど、確かめられなければ URL の形で判断する
+        (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? url.hasDirectoryPath
+    }
 
     /// しおりや再生回数と同じキー (Track.bookmarkKey) から、ライブラリの曲を引く
     func track(forKey key: String) -> Track? { byKey[key] }
@@ -40,31 +49,36 @@ final class LibraryStore {
         Task.detached(priority: .utility) { snapshot.save(to: dir) }
     }
 
-    // MARK: フォルダ
+    // MARK: 読み込む場所
 
-    func addFolders(_ urls: [URL]) {
-        var changed = false
-        for url in urls where !data.folders.contains(url) {
-            data.folders.append(url)
-            changed = true
-        }
-        if changed { rescan() }
+    /// フォルダやファイルをライブラリに入れる。入れられるものが 1 つでもあったかを返す
+    /// (音源でも CUE シートでもプレイリストでもないファイルは入れない)
+    @discardableResult
+    func addSources(_ urls: [URL]) -> Bool {
+        let usable = urls.filter { Importer.isLibrarySource($0, isDirectory: isFolder($0)) }
+        guard !usable.isEmpty else { return false }
+        let before = data.sources
+        guard data.addSources(usable) > 0 else { return true }   // すべて登録済み
+        // 足した場所だけを調べる (ほかの調べものの途中なら、全体を調べ直す)
+        rescan(only: scanning ? nil : data.sources.filter { !before.contains($0) })
+        return true
     }
 
-    func removeFolder(_ url: URL) {
-        data.folders.removeAll { $0 == url }
+    func removeSource(_ url: URL) {
+        data.removeSource(url)
         rescan()
     }
 
-    /// フォルダを調べ直す。前からある曲はそのまま使い、新しい曲と書き換えられた曲のタグだけを読む
-    func rescan() {
+    /// 登録した場所を調べ直す。前からある曲はそのまま使い、新しい曲と書き換えられた曲のタグだけを読む。
+    /// added を渡すと、その場所だけを調べて、今の曲に足す
+    func rescan(only added: [URL]? = nil) {
         scanTask?.cancel()
-        let folders = data.folders
+        let sources = added ?? data.sources
         scanning = true
         progress = nil
         scanTask = Task {
-            let (scanned, modified) = await Task.detached(priority: .utility) { () -> ([Track], [String: Double]) in
-                let tracks = folders.isEmpty ? [] : Importer.expand(folders).tracks
+            let (found, foundModified) = await Task.detached(priority: .utility) { () -> ([Track], [String: Double]) in
+                let tracks = sources.isEmpty ? [] : Importer.expand(sources).tracks
                 var modified: [String: Double] = [:]
                 for t in tracks where modified[t.url.path] == nil {
                     let date = try? t.url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
@@ -73,7 +87,11 @@ final class LibraryStore {
                 return (tracks, modified)
             }.value
             guard !Task.isCancelled else { return }
-            data.merge(scanned: scanned, modified: modified)
+            if added == nil {
+                data.merge(scanned: found, modified: foundModified)
+            } else {
+                data.append(scanned: found, modified: foundModified)
+            }
             rebuildIndex()
             await loadMetadata()
             guard !Task.isCancelled else { return }

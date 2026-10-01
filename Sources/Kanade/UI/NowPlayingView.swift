@@ -239,6 +239,11 @@ struct ControlBar: View {
             CapsuleSlider(value: $m.volume, tint: .white.opacity(0.85))
                 .frame(width: 110)
                 .onChange(of: model.volume) { if model.muted { model.muted = false } }
+                .disabled(model.volumeLocked)
+                .opacity(model.volumeLocked ? 0.4 : 1)
+                .help(!model.bitPerfect ? "音量" : model.volumeLocked
+                      ? "ビットパーフェクト再生中: このデバイスの音量は、アンプなどデバイス側で調整してください"
+                      : "ビットパーフェクト再生中: 出力デバイス側の音量を動かします")
 
             Spacer(minLength: 12)
 
@@ -257,9 +262,9 @@ struct ControlBar: View {
             .fixedSize()
             .foregroundStyle(model.effectiveRate == 1 ? .white.opacity(0.7) : accent)
             .padding(.horizontal, 6)
-            .disabled(model.asmrMode)
-            .opacity(model.asmrMode ? 0.45 : 1)
-            .help(model.asmrMode ? "ASMR モード中は等速で再生します" : "再生速度")
+            .disabled(model.effectsOff)
+            .opacity(model.effectsOff ? 0.45 : 1)
+            .help(model.asmrMode ? "ASMR モード中は等速で再生します" : model.bitPerfect ? "ビットパーフェクト再生中は等速で再生します" : "再生速度")
 
             ASMRButton(accent: accent)
             if model.asmrMode {
@@ -272,10 +277,16 @@ struct ControlBar: View {
                 }
             }
 
-            IconButton(symbol: "slider.vertical.3", size: 14, active: showSound || (!model.asmrMode && model.eqEnabled && model.eqBands.contains { $0 != 0 }),
+            IconButton(symbol: "slider.vertical.3", size: 14, active: showSound || (!model.effectsOff && model.eqEnabled && model.eqBands.contains { $0 != 0 }),
                        tint: accent, help: "イコライザー・音響効果 (⌥⌘E)") { showSound.toggle() }
                 .popover(isPresented: $showSound, arrowEdge: .top) { SoundPanel().environment(model) }
                 .onReceive(NotificationCenter.default.publisher(for: .kanadeShowSound)) { _ in showSound = true }
+            IconButton(symbol: model.bitPerfect ? "checkmark.seal.fill" : "checkmark.seal", size: 14, active: model.bitPerfect,
+                       tint: model.bitPerfectShortfall == nil ? accent : .orange,
+                       help: !model.bitPerfect ? "ビットパーフェクト再生: 音を変える処理をすべて外して、元のデータのまま出力する (⇧⌘B)"
+                           : model.bitPerfectShortfall ?? "ビットパーフェクト再生中 (⇧⌘B で解除)") {
+                model.setBitPerfect(!model.bitPerfect)
+            }
 
             Button { model.toggleABLoop() } label: {
                 Text(model.loopB != nil ? "A-B" : model.loopA != nil ? "A-" : "A-B")

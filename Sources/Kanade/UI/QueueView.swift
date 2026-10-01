@@ -104,6 +104,18 @@ struct QueueView: View {
                                     LibraryStore.shared.createPlaylist(name: tracks.first?.displayTitle ?? "新しいプレイリスト", tracks: tracks)
                                 }
                             }
+                            let outside = model.queue.filter { ids.contains($0.id) && LibraryStore.shared.track(forKey: $0.bookmarkKey) == nil }
+                            if !outside.isEmpty {
+                                Button("ライブラリに追加") {
+                                    let files = outside.map(Importer.librarySource)
+                                    if LibraryStore.shared.addSources(files) {
+                                        model.showToast(outside.count == 1 ? "「\(outside[0].displayTitle)」をライブラリに追加しました" : "\(outside.count) 曲をライブラリに追加しました",
+                                                        symbol: "books.vertical")
+                                    } else {
+                                        model.showToast("この形式のファイルは、ライブラリに追加できません", symbol: "exclamationmark.triangle")
+                                    }
+                                }
+                            }
                             Button("Finder で表示") {
                                 NSWorkspace.shared.activateFileViewerSelecting(ids.compactMap { model.track($0)?.url })
                             }

@@ -102,14 +102,40 @@ enum LibraryIndex {
 
 /// ライブラリの保存内容 (Application Support/Kanade/library.json)
 struct LibraryData: Codable, Equatable {
-    /// 読み込むフォルダ
-    var folders: [URL] = []
+    /// 読み込む場所 (フォルダ、または単体で追加したファイル)
+    var sources: [URL] = []
     var tracks: [Track] = []
     /// 曲をライブラリに入れた日時 (Track.bookmarkKey → 日時)
     var added: [String: Date] = [:]
     /// ファイルの更新日時 (パス → 秒)。変わっていたらタグを読み直す
     var modified: [String: Double] = [:]
     var playlists: [Playlist] = []
+
+    /// 保存するときの名前は、フォルダだけを登録できた頃のまま
+    private enum CodingKeys: String, CodingKey {
+        case sources = "folders", tracks, added, modified, playlists
+    }
+
+    /// 読み込む場所を足す。足した数を返す。
+    /// すでに登録してある場所と、登録済みのフォルダの中にあるものは足さない。
+    /// フォルダを足したら、その中にある登録済みの場所 (単体のファイルや下のフォルダ) は、まとめて読まれるので外す
+    @discardableResult
+    mutating func addSources(_ urls: [URL]) -> Int {
+        func path(_ url: URL) -> String { url.standardizedFileURL.path }
+        var added = 0
+        for url in urls {
+            let new = path(url)
+            guard !sources.contains(where: { new == path($0) || new.hasPrefix(path($0) + "/") }) else { continue }
+            sources.removeAll { path($0).hasPrefix(new + "/") }
+            sources.append(url)
+            added += 1
+        }
+        return added
+    }
+
+    mutating func removeSource(_ url: URL) {
+        sources.removeAll { $0.standardizedFileURL.path == url.standardizedFileURL.path }
+    }
 
     /// フォルダを調べ直した結果を取り込む。
     /// 前からある曲は読み込み済みのタグをそのまま使い、新しい曲と書き換えられた曲だけを「未読み込み」にする
@@ -134,6 +160,11 @@ struct LibraryData: Codable, Equatable {
         tracks = merged
         modified = newModified
         added = added.filter { seen.contains($0.key) }
+    }
+
+    /// 足した場所を調べた結果を、今の曲に足す (前からある曲はそのまま)
+    mutating func append(scanned: [Track], modified newModified: [String: Double], now: Date = Date()) {
+        merge(scanned: tracks + scanned, modified: modified.merging(newModified) { _, new in new }, now: now)
     }
 
     static func load(from dir: URL) -> LibraryData {

@@ -93,7 +93,23 @@ final class PlayerModel {
     var repeatMode = RepeatMode(rawValue: Defaults.string("repeat") ?? "") ?? .off {
         didSet { Defaults.set("repeat", repeatMode.rawValue); engine.invalidateUpcoming() }
     }
-    var volume = Defaults.double("volume", 0.8) { didSet { Defaults.set("volume", volume); applyVolume() } }
+    /// アプリの中で掛ける音量 (0〜1)
+    private var appVolume = Defaults.double("volume", 0.8) { didSet { Defaults.set("volume", appVolume); applyVolume() } }
+    /// 音量スライダーの値。ふだんはアプリの音量、ビットパーフェクト再生中は出力デバイス側の音量
+    /// (アプリの中で音量を下げると、元のデータのままではなくなるため)
+    var volume: Double {
+        get { bitPerfect ? deviceVolume ?? 1 : appVolume }
+        set {
+            guard bitPerfect else {
+                appVolume = newValue
+                return
+            }
+            guard deviceVolume != nil, let device = engine.outputDeviceID else { return }
+            let value = min(1, max(0, newValue))
+            OutputDevice.setVolume(device, Float(value))
+            deviceVolume = value
+        }
+    }
     var muted = false { didSet { applyVolume() } }
     var rate = Defaults.double("rate", 1) { didSet { Defaults.set("rate", rate); applyRate() } }
     var pitch = Defaults.double("pitch", 0) { didSet { Defaults.set("pitch", pitch); applyRate() } }
@@ -102,7 +118,7 @@ final class PlayerModel {
     }
     var balance = Defaults.double("balance", 0) { didSet { Defaults.set("balance", balance); applyBalance() } }
     var crossfade = Defaults.double("crossfade", 0) {
-        didSet { Defaults.set("crossfade", crossfade); engine.crossfadeDuration = crossfade; engine.invalidateUpcoming() }
+        didSet { Defaults.set("crossfade", crossfade); engine.crossfadeDuration = bitPerfect ? 0 : crossfade; engine.invalidateUpcoming() }
     }
     var replayGain = ReplayGainMode(rawValue: Defaults.string("replayGain") ?? "") ?? .track {
         didSet { Defaults.set("replayGain", replayGain.rawValue) }
@@ -138,15 +154,30 @@ final class PlayerModel {
     private var deviceProfiles: [String: String] = Defaults.codable("deviceProfiles") ?? [:] {
         didSet { Defaults.setCodable("deviceProfiles", deviceProfiles) }
     }
-    /// 出力デバイスのサンプルレートを曲に合わせて切り替える
+    /// 出力デバイスのサンプルレートとビット深度を曲に合わせて切り替える (ビットパーフェクト再生中は常に合わせる)
     var matchSampleRate = Defaults.bool("matchSampleRate", false) {
         didSet {
             Defaults.set("matchSampleRate", matchSampleRate)
-            engine.matchSampleRate = matchSampleRate
-            if !matchSampleRate { engine.restoreOutputDevice() }
+            engine.matchSampleRate = matchSampleRate || bitPerfect
+            if !engine.matchSampleRate { engine.restoreOutputDevice() }
             reloadForOutputChange()
         }
     }
+    /// ビットパーフェクト再生: 音を変える処理をすべて外し、デバイスの形式を曲に合わせ、アプリの音量を最大にして、
+    /// 元のデータのまま出力する。EQ などの設定は残したまま使わないだけなので、オフにすれば元に戻る。
+    /// 切り替えは setBitPerfect で行う
+    private(set) var bitPerfect = Defaults.bool("bitPerfect", false) { didSet { Defaults.set("bitPerfect", bitPerfect) } }
+    /// ビットパーフェクト再生に入るときに ASMR モードを止めたか (出るときに戻す)
+    private var bitPerfectSuspendedASMR = Defaults.bool("bitPerfectSuspendedASMR", false) {
+        didSet { Defaults.set("bitPerfectSuspendedASMR", bitPerfectSuspendedASMR) }
+    }
+    /// ビットパーフェクト再生の間、アプリの音量の代わりにデバイス側で下げている量。出るときに戻す
+    private var bitPerfectOffsets: DeviceVolumeOffsets = Defaults.codable("bitPerfectOffsets") ?? DeviceVolumeOffsets() {
+        didSet { Defaults.setCodable("bitPerfectOffsets", bitPerfectOffsets) }
+    }
+    /// 出力デバイス側の音量 (0〜1)。Mac から変えられないデバイスなら nil
+    private(set) var deviceVolume: Double?
+    @ObservationIgnored private let deviceVolumeObserver = DeviceVolumeObserver()
     /// 出力デバイスを排他的に使う
     var exclusiveMode = Defaults.bool("exclusiveMode", false) {
         didSet {
@@ -163,7 +194,7 @@ final class PlayerModel {
     private var loudness = LoudnessStore()
     private var loudnessInFlight: [String: Task<LoudnessResult?, Never>] = [:]
     /// 表示を作り直すための番号 (出力デバイスの状態が変わったときに進める)
-    private(set) var outputRevision = 0
+    private(set) var outputRevision = 0 { didSet { refreshDeviceVolume() } }
 
     // MARK: 再生回数・お気に入り
     private(set) var stats = PlayStats()
@@ -177,6 +208,11 @@ final class PlayerModel {
     var asmrMode = Defaults.bool("asmrMode", false) {
         didSet {
             Defaults.set("asmrMode", asmrMode)
+            // ASMR モードは音を加工するので、ビットパーフェクト再生とは両立しない (あとから選んだほうを使う)
+            if asmrMode, bitPerfect {
+                bitPerfectSuspendedASMR = false
+                setBitPerfect(false, quietly: true)
+            }
             applyEQ()
             applyRate()
             applyBalance()
@@ -215,14 +251,16 @@ final class PlayerModel {
     var asmrResume = Defaults.bool("asmrResume", true) { didSet { Defaults.set("asmrResume", asmrResume) } }
 
     var powerSaving: Bool { asmrMode && lowPowerDisplay }
-    /// 実際に再生している速さ (ASMR モード中は常に等速)
-    var effectiveRate: Double { asmrMode ? 1 : rate }
+    /// EQ・ヘッドホンの補正・速度・キー・バランスを使わない再生か (ASMR モードとビットパーフェクト再生)
+    var effectsOff: Bool { asmrMode || bitPerfect }
+    /// 実際に再生している速さ (ASMR モードとビットパーフェクト再生では常に等速)
+    var effectiveRate: Double { effectsOff ? 1 : rate }
     var sleepFadeDuration: Double { asmrMode ? asmrSleepFade : 12 }
 
     /// 小音量時のラウドネス補正量 (低域 dB, 高域 dB)。音量を下げるほど聞こえにくくなる低音・高音を補う
     var loudnessBoost: (low: Float, high: Float) {
         guard asmrMode, asmrLoudness else { return (0, 0) }
-        let attenuation = Float(40 * log10(max(volume, 0.01)))   // 出力は volume² なので 40log
+        let attenuation = Float(40 * log10(max(appVolume, 0.01)))   // 出力は volume² なので 40log
         return (min(9, max(0, -attenuation * 0.3)), min(3.5, max(0, -attenuation * 0.1)))
     }
 
@@ -269,9 +307,9 @@ final class PlayerModel {
     private var lastClockPublish: CFTimeInterval = 0
 
     private init() {
-        engine.volume = Float(volume)
+        applyVolume()
         engine.preservePitch = preservePitch
-        engine.crossfadeDuration = crossfade
+        engine.crossfadeDuration = bitPerfect ? 0 : crossfade
         applyRate()
         applyBalance()
         applyEQ()
@@ -281,7 +319,8 @@ final class PlayerModel {
         resumeStore = ResumeStore.load(from: Self.supportDirectory)
         loudness = LoudnessStore.load(from: Self.supportDirectory)
         stats = PlayStats.load(from: Self.supportDirectory)
-        engine.matchSampleRate = matchSampleRate
+        engine.matchSampleRate = matchSampleRate || bitPerfect
+        deviceVolumeObserver.onChange = { [weak self] in MainActor.assumeIsolated { self?.readDeviceVolume() } }
 
         engine.provideNext = { [weak self] in MainActor.assumeIsolated { self?.readyNextItem() } }
         engine.onAdvance = { [weak self] id in MainActor.assumeIsolated { self?.didAdvance(to: id) } }
@@ -295,6 +334,9 @@ final class PlayerModel {
             engine.setOutputDevice(d.id)
         }
         applyDeviceProfile()
+        // 前回とは違うデバイスで始まったときのために (ビットパーフェクト再生のまま終了していた場合)
+        moveBitPerfectVolume(to: engine.outputDeviceID, uid: currentOutputUID)
+        refreshDeviceVolume()
         if exclusiveMode { applyExclusiveMode() }
         setupRemoteCommands()
         restore()
@@ -656,10 +698,11 @@ final class PlayerModel {
 
     func skip(by delta: Double) { seek(to: clock.position + delta) }
 
-    /// 再生速度を少し変える (0.5〜2 倍)。ASMR モード中は等速のまま
+    /// 再生速度を少し変える (0.5〜2 倍)。ASMR モードとビットパーフェクト再生では等速のまま
     func changeRate(by delta: Double) {
-        guard !asmrMode else {
-            showToast("ASMR モード中は速度を変えられません", symbol: "ear")
+        guard !effectsOff else {
+            showToast(asmrMode ? "ASMR モード中は速度を変えられません" : "ビットパーフェクト再生中は速度を変えられません",
+                      symbol: asmrMode ? "ear" : "checkmark.seal")
             return
         }
         rate = min(2, max(0.5, ((rate + delta) * 100).rounded() / 100))
@@ -897,6 +940,9 @@ final class PlayerModel {
     func refreshOutputDevices() { outputDevices = AudioOutputs.list() }
 
     func selectOutputDevice(_ device: AudioOutputDevice?) {
+        // 音を出し始める前に、新しいデバイス側の音量を合わせておく (ビットパーフェクト再生中)
+        let target = device?.id ?? AudioOutputs.defaultDeviceID()
+        moveBitPerfectVolume(to: target, uid: device?.uid ?? outputDevices.first { $0.id == target }?.uid ?? "default")
         outputDeviceUID = device?.uid
         Defaults.set("outputDevice", device?.uid)
         let pos = clock.position, wasPlaying = isPlaying
@@ -920,6 +966,8 @@ final class PlayerModel {
     }
 
     private func gain(for t: Track) -> Float {
+        // ビットパーフェクト再生では、音量をそろえるためのゲインも掛けない
+        if bitPerfect { return 1 }
         let m = t.meta
         var (g, p): (Double?, Double?) = switch replayGain {
         case .off: (nil, nil)
@@ -938,7 +986,7 @@ final class PlayerModel {
 
     // MARK: - ラウドネスの解析
 
-    private var usesLoudnessScan: Bool { loudnessScan && replayGain != .off && !asmrMode }
+    private var usesLoudnessScan: Bool { loudnessScan && replayGain != .off && !effectsOff }
 
     /// 今の曲の、音量をそろえるためのゲイン (dB) と、その出どころ
     var currentGainInfo: (db: Double, source: String)? {
@@ -1097,6 +1145,144 @@ final class PlayerModel {
         }
     }
 
+    // MARK: - ビットパーフェクト再生
+
+    /// ビットパーフェクト再生を切り替える。
+    /// 入るときは、アプリの音量を最大にする代わりに、同じ分だけ出力デバイス側の音量を下げて、聞こえる大きさを保つ。
+    /// デバイス側で下げきれず音が大きくなるときは、切り替える前に確かめる
+    func setBitPerfect(_ on: Bool, quietly: Bool = false) {
+        guard on != bitPerfect else { return }
+        let device = engine.outputDeviceID
+        if on {
+            // 消音中でも同じように扱う (消音を解いたときに、急に大きな音が出ないように)
+            let attenuation = DeviceVolumeOffsets.attenuation(ofAppVolume: appVolume)
+            let room = device.map { Double(OutputDevice.volumeRoomBelow($0)) } ?? 0
+            let expected = OutputDevice.loudnessJump(attenuation: attenuation, room: room)
+            if expected > 1, !confirmLouder(by: expected, deviceHasVolume: room > 0) { return }
+            // 先にデバイス側を下げてから、アプリの音量を最大にする (逆の順だと、一瞬大きな音が出る)
+            var lowered = 0.0
+            if attenuation > 0.05, let device { lowered = Double(-OutputDevice.adjustVolume(device, byDB: Float(-attenuation))) }
+            // 見込みどおりに下げられなかったときも、切り替える前に確かめる (やめるなら、下げた分を戻す)
+            if expected <= 1, attenuation - lowered > 1.5, !confirmLouder(by: attenuation - lowered, deviceHasVolume: room > 0) {
+                if lowered > 0.05, let device { OutputDevice.adjustVolume(device, byDB: Float(lowered)) }
+                return
+            }
+            if asmrMode {
+                asmrMode = false
+                bitPerfectSuspendedASMR = true
+            } else {
+                bitPerfectSuspendedASMR = false
+            }
+            bitPerfectOffsets.record(currentOutputUID, db: lowered)
+            bitPerfect = true
+            applyBitPerfect()
+            if !quietly {
+                showToast(deviceVolume == nil
+                          ? "ビットパーフェクト再生: 音を変える処理をすべて外しました（音量はアンプなどデバイス側で調整してください）"
+                          : "ビットパーフェクト再生: 音を変える処理をすべて外しました（音量はデバイス側の音量を動かします）",
+                          symbol: "checkmark.seal")
+            }
+        } else {
+            bitPerfect = false
+            applyBitPerfect()
+            // デバイス側で下げていた音量を元に戻す。今のデバイスは、アプリの音量が下がりきってから (逆の順だと、一瞬大きな音が出る)
+            let current = currentOutputUID
+            for (uid, db) in bitPerfectOffsets.takeAll() where db > 0.05 {
+                guard let id = outputDevices.first(where: { $0.uid == uid })?.id ?? (uid == current ? device : nil) else { continue }
+                if uid == current {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                        guard let self, !self.bitPerfect, self.engine.outputDeviceID == id else { return }
+                        OutputDevice.adjustVolume(id, byDB: Float(db))
+                        self.readDeviceVolume()
+                    }
+                } else {
+                    OutputDevice.adjustVolume(id, byDB: Float(db))
+                }
+            }
+            if bitPerfectSuspendedASMR {
+                bitPerfectSuspendedASMR = false
+                if !asmrMode { asmrMode = true }
+            }
+            if !quietly { showToast("ビットパーフェクト再生を終了しました（EQ などの設定は元のまま使われます）", symbol: "checkmark.seal") }
+        }
+    }
+
+    /// ビットパーフェクト再生中に出力デバイスが変わる: アプリの音量で下げていた分を、新しいデバイス側で下げ直す
+    /// (デバイス側の音量は、デバイスごとに別々なので)。使わなくなったデバイスの音量は元に戻す。
+    /// 新しいデバイスで下げきれないなら、急に大きな音が出ないよう、ビットパーフェクト再生を解除する
+    private func moveBitPerfectVolume(to device: AudioDeviceID?, uid: String) {
+        guard bitPerfect, let device else { return }
+        for other in bitPerfectOffsets.devices where other != uid {
+            // 外されているデバイスは、戻せないので覚えたままにする (またつないだときに、二重に下げないため)
+            guard let id = outputDevices.first(where: { $0.uid == other })?.id, let db = bitPerfectOffsets.take(other) else { continue }
+            if db > 0.05 { OutputDevice.adjustVolume(id, byDB: Float(db)) }
+        }
+        guard !bitPerfectOffsets.isLowered(uid) else { return }
+        let attenuation = DeviceVolumeOffsets.attenuation(ofAppVolume: appVolume)
+        let room = Double(OutputDevice.volumeRoomBelow(device))
+        guard OutputDevice.loudnessJump(attenuation: attenuation, room: room) <= 1 else {
+            setBitPerfect(false, quietly: true)
+            showToast("出力デバイスが変わったので、ビットパーフェクト再生を解除しました（このデバイスでは音量を下げきれず、大きな音が出てしまうため）",
+                      symbol: "exclamationmark.triangle")
+            return
+        }
+        let lowered = attenuation > 0.05 ? Double(-OutputDevice.adjustVolume(device, byDB: Float(-attenuation))) : 0
+        bitPerfectOffsets.record(uid, db: lowered)
+    }
+
+    /// ビットパーフェクト再生かどうかで変わる設定を、すべてエンジンへ渡し直す。今の曲は同じ位置から読み込み直す
+    private func applyBitPerfect() {
+        applyVolume()
+        applyEQ()
+        applyRate()
+        applyBalance()
+        engine.crossfadeDuration = bitPerfect ? 0 : crossfade
+        engine.matchSampleRate = matchSampleRate || bitPerfect
+        if !engine.matchSampleRate { engine.restoreOutputDevice() }
+        engine.invalidateUpcoming()
+        reloadForOutputChange()
+    }
+
+    /// アプリの音量を最大にすると音が大きくなるときに、切り替えてよいかを確かめる
+    private func confirmLouder(by db: Double, deviceHasVolume: Bool) -> Bool {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "音が大きくなります"
+        let name = engine.outputInfo.name
+        let reason = deviceHasVolume
+            ? "アプリの音量で下げていた分を、「\(name)」の音量だけでは下げきれません。"
+            : "「\(name)」の音量は、Mac からは変えられません。"
+        alert.informativeText = "ビットパーフェクト再生では、アプリの音量を最大にします。\(reason)切り替えると、今より約 \(Int(db.rounded())) dB 大きな音で再生されます。\n\nアンプやヘッドホンの音量を下げてから切り替えてください。"
+        alert.addButton(withTitle: "キャンセル")
+        alert.addButton(withTitle: "切り替える")
+        return alert.runModal() == .alertSecondButtonReturn
+    }
+
+    /// 出力デバイス側の音量を読み直す (デバイスが変わっていれば、見張る先も切り替える)
+    private func refreshDeviceVolume() {
+        deviceVolumeObserver.observe(engine.outputDeviceID)
+        readDeviceVolume()
+    }
+
+    private func readDeviceVolume() {
+        let value = engine.outputDeviceID.flatMap(OutputDevice.volume).map(Double.init)
+        if value != deviceVolume { deviceVolume = value }
+    }
+
+    /// ビットパーフェクト再生中で、音量を Mac から変えられないデバイスを使っているか (音量スライダーを動かせない)
+    var volumeLocked: Bool { bitPerfect && deviceVolume == nil }
+
+    /// ビットパーフェクト再生にしているのに、元のデータのままでは出力できていないときの理由
+    var bitPerfectShortfall: String? {
+        guard bitPerfect, let path = signalPath else { return nil }
+        switch path.quality {
+        case .bitPerfect, .volumeOnly: return nil   // 音量だけ = 消音中
+        case .resampled: return "出力デバイスを曲のサンプルレートに合わせられないため、サンプルレートを変換しています"
+        case .reduced: return "出力デバイスを曲のビット深度に合わせられないため、ビット数を減らして出力しています"
+        case .processed: return "この音源は PCM に変換してから再生するため、元のデータのままにはなりません"
+        }
+    }
+
     /// エンジンを始められなかった: 再生中の表示のまま固まらないよう、止めて知らせる
     private func engineFailedToStart() {
         isPlaying = false
@@ -1131,10 +1317,15 @@ final class PlayerModel {
         if let br = m.bitrate, m.lossless != true, br > 0 { parts.append("\(br / 1000)kbps") }
 
         var stages: [SignalPath.Stage] = []
+        if m.bitDepth == 1 {
+            stages.append(.init(name: "PCM への変換", detail: "DSD → PCM", symbol: "waveform.path"))
+        }
         if let gain = currentGainInfo {
             stages.append(.init(name: "音量の均一化", detail: String(format: "%@ %+.1f dB", gain.source, gain.db), symbol: "speaker.wave.2"))
         }
-        if !asmrMode {
+        if bitPerfect {
+            // 音を変える処理は、どれも通さない
+        } else if !asmrMode {
             if eqEnabled, eqPreamp != 0 || eqBands.contains(where: { $0 != 0 }) {
                 stages.append(.init(name: "イコライザー", detail: eqPresetName, symbol: "slider.vertical.3"))
             }
@@ -1155,18 +1346,25 @@ final class PlayerModel {
         if resampled {
             stages.append(.init(name: "サンプルレート変換", detail: "\(Self.sampleRateLabel(fileRate)) → \(Self.sampleRateLabel(chainRate))（最高品質）", symbol: "arrow.triangle.2.circlepath"))
         }
-        let softVolume = muted || volume < 0.9995
+        let softVolume = muted || (!bitPerfect && appVolume < 0.9995)
         if softVolume {
-            stages.append(.init(name: "音量", detail: muted ? "消音" : String(format: "%.1f dB", 40 * log10(max(volume, 0.0001))), symbol: "speaker.wave.1"))
+            stages.append(.init(name: "音量", detail: muted ? "消音" : String(format: "%.1f dB", 40 * log10(max(appVolume, 0.0001))), symbol: "speaker.wave.1"))
         }
         let info = engine.outputInfo
+        // 曲のビット深度を、出力までそのまま運べているか
+        let sourceBits = engine.current?.trackID == t.id ? engine.current?.sourceBits : nil
+        let reduction = SignalPath.depthReduction(source: sourceBits, output: info.format?.precision)
+        if let reduction {
+            stages.append(.init(name: "ビット深度の変換", detail: reduction, symbol: "arrow.down.right.and.arrow.up.left"))
+        }
         var output = info.name + " · " + Self.sampleRateLabel(info.rate)
-        if let bits = info.bits, bits > 0 { output += " / \(bits)bit" }
+        if let format = info.format, format.bits > 0 { output += " / \(format.bits)bit" + (format.isFloat ? " 浮動小数点" : "") }
         if let transport = info.transport { output += "（\(transport)）" }
         if engine.isExclusive { output += " · 排他" }
 
-        let processed = stages.contains { !["サンプルレート変換", "音量"].contains($0.name) }
-        let quality: SignalPath.Quality = processed ? .processed : resampled ? .resampled : softVolume ? .volumeOnly : .bitPerfect
+        let processed = stages.contains { !["サンプルレート変換", "音量", "ビット深度の変換"].contains($0.name) }
+        let quality: SignalPath.Quality = processed ? .processed : resampled ? .resampled
+            : reduction != nil ? .reduced : softVolume ? .volumeOnly : .bitPerfect
         return SignalPath(source: parts.joined(separator: " · "), stages: stages, output: output, quality: quality)
     }
 
@@ -1288,6 +1486,7 @@ final class PlayerModel {
 
     private func reloadAfterDeviceChange() {
         refreshOutputDevices()
+        moveBitPerfectVolume(to: engine.outputDeviceID, uid: currentOutputUID)
         applyDeviceProfile()
         outputRevision += 1
         guard let t = currentTrack, engine.current != nil else { return }
@@ -1310,26 +1509,33 @@ final class PlayerModel {
     }
 
     private func applyVolume() {
-        engine.volume = muted ? 0 : Float(volume)
+        engine.volume = muted ? 0 : bitPerfect ? 1 : Float(appVolume)
         if asmrMode, asmrLoudness { applyASMR() }
     }
 
     private func applyEQ() {
-        engine.setEQ(bands: eqBands, preamp: eqPreamp, enabled: eqEnabled && !asmrMode)
+        engine.setEQ(bands: eqBands, preamp: eqPreamp, enabled: eqEnabled && !effectsOff)
         applyASMR()
     }
 
     private func applyRate() {
         engine.rate = Float(effectiveRate)
-        engine.pitch = asmrMode ? 0 : Float(pitch)
+        engine.pitch = effectsOff ? 0 : Float(pitch)
         applyASMR()
         updateNowPlayingInfo()
     }
 
-    private func applyBalance() { engine.balance = asmrMode ? 0 : Float(balance) }
+    private func applyBalance() { engine.balance = effectsOff ? 0 : Float(balance) }
 
     /// 最後段の処理ユニットの設定を組み立てる (ASMR モードの処理と、通常の再生でのクロスフィード・クリップ防止・パラメトリック EQ)
     private func applyASMR() {
+        if bitPerfect {
+            // 何も加工しない (処理ユニットは、音を 1 ビットも変えずに通す)
+            engine.asmrSettings = ASMRSettings()
+            engine.softTransitions = false
+            engine.eqProfile = nil
+            return
+        }
         var s = ASMRSettings()
         // 「処理前の音と比べる」の間は、音量のならしなどを外す (左右の入れ替えとリミッターは残す)
         let processing = asmrMode && !asmrCompare

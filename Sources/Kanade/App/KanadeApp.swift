@@ -66,9 +66,9 @@ struct PlayerCommands: Commands {
             Button("音量を下げる") { model.volume = max(0, model.volume - 0.05) }.keyboardShortcut(.downArrow, modifiers: .command)
             Button("消音") { model.muted.toggle() }
             Divider()
-            Button("速度を上げる") { model.changeRate(by: 0.05) }.keyboardShortcut("=", modifiers: .command).disabled(model.asmrMode)
-            Button("速度を下げる") { model.changeRate(by: -0.05) }.keyboardShortcut("-", modifiers: .command).disabled(model.asmrMode)
-            Button("等速に戻す") { model.rate = 1 }.keyboardShortcut("0", modifiers: .command).disabled(model.asmrMode || model.rate == 1)
+            Button("速度を上げる") { model.changeRate(by: 0.05) }.keyboardShortcut("=", modifiers: .command).disabled(model.effectsOff)
+            Button("速度を下げる") { model.changeRate(by: -0.05) }.keyboardShortcut("-", modifiers: .command).disabled(model.effectsOff)
+            Button("等速に戻す") { model.rate = 1 }.keyboardShortcut("0", modifiers: .command).disabled(model.effectsOff || model.rate == 1)
             Divider()
             Button("シャッフル") { model.shuffle.toggle() }.keyboardShortcut("s")
             Button("リピートを切り替え") { model.repeatMode = model.repeatMode.next }.keyboardShortcut("r")
@@ -91,9 +91,13 @@ struct PlayerCommands: Commands {
                 .disabled(!model.asmrMode)
             Button("左右を確認 (ASMR)") { model.playChannelCheck() }.disabled(!model.asmrMode)
             Divider()
+            Toggle("ビットパーフェクト再生", isOn: Binding(get: { model.bitPerfect }, set: { model.setBitPerfect($0) }))
+                .keyboardShortcut("b", modifiers: [.command, .shift])
             Toggle("排他モード", isOn: Binding(get: { model.exclusiveMode }, set: { model.exclusiveMode = $0 }))
                 .disabled(model.switchingExclusive)
-            Toggle("デバイスのサンプルレートを曲に合わせる", isOn: Binding(get: { model.matchSampleRate }, set: { model.matchSampleRate = $0 }))
+            Toggle("デバイスのサンプルレートとビット深度を曲に合わせる",
+                   isOn: Binding(get: { model.matchSampleRate || model.bitPerfect }, set: { model.matchSampleRate = $0 }))
+                .disabled(model.bitPerfect)
         }
         CommandGroup(before: .toolbar) {
             Button("歌詞を表示 / 隠す") { withAnimation { model.showLyrics.toggle() } }.keyboardShortcut("l")

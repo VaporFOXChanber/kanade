@@ -34,6 +34,8 @@ struct SignalPath: Equatable {
         case volumeOnly
         /// サンプルレートの変換だけをしている
         case resampled
+        /// 加工はしていないが、出力までの途中でビット数が減っている
+        case reduced
         /// EQ などの加工をしている
         case processed
 
@@ -42,6 +44,7 @@ struct SignalPath: Equatable {
             case .bitPerfect: "ビットパーフェクト"
             case .volumeOnly: "無加工（音量のみ調整）"
             case .resampled: "サンプルレートを変換"
+            case .reduced: "ビット深度を変換"
             case .processed: "音を加工中"
             }
         }
@@ -51,6 +54,43 @@ struct SignalPath: Equatable {
     var stages: [Stage]
     var output: String
     var quality: Quality
+
+    /// 曲のビット数を出力までそのまま運べないときの説明 (運べていれば nil)。
+    /// source は曲のビット深度 (圧縮音源などは nil)、output は出力デバイスの形式が運べるビット数
+    static func depthReduction(source: Int?, output: Int?) -> String? {
+        guard let source, source > 1 else { return nil }
+        // アプリの中では 32bit 浮動小数点で扱うので、24bit を超える分は運べない
+        let carried = min(24, output ?? 24)
+        guard source > carried else { return nil }
+        return carried < 24 ? "\(source)bit → \(carried)bit（デバイスの形式）" : "\(source)bit → 24bit 相当（32bit 浮動小数点で処理）"
+    }
+}
+
+/// ビットパーフェクト再生の間、アプリの音量の代わりに出力デバイス側で下げている音量 (デバイスごと)。
+/// デバイス側の音量はデバイスごとに別々なので、出力デバイスを切り替えるたびに下げ直し、使わなくなったほうは戻す
+struct DeviceVolumeOffsets: Codable, Equatable {
+    /// デバイスの UID → 下げている量 (dB)。0 は「下げる必要がなかった」
+    private var lowered: [String: Double] = [:]
+
+    var devices: [String] { lowered.keys.sorted() }
+
+    /// このデバイスの音量は、もう合わせてあるか (もう一度下げてはいけない)
+    func isLowered(_ device: String) -> Bool { lowered[device] != nil }
+
+    mutating func record(_ device: String, db: Double) { lowered[device] = max(0, db) }
+
+    /// 下げていた量を取り出す (戻すときに使う)
+    mutating func take(_ device: String) -> Double? { lowered.removeValue(forKey: device) }
+
+    mutating func takeAll() -> [String: Double] {
+        defer { lowered = [:] }
+        return lowered
+    }
+
+    /// アプリの音量 (0〜1) で下げている量 (dB、0 以上)。出力はアプリの音量の 2 乗に比例する
+    static func attenuation(ofAppVolume volume: Double) -> Double {
+        volume >= 0.9995 ? 0 : -40 * log10(max(volume, 0.001))
+    }
 }
 
 /// 再生回数・最後に再生した日時・お気に入り (曲ごと)

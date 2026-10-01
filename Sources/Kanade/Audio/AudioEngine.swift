@@ -12,6 +12,15 @@ struct PlaybackItem {
     let gain: Float
 
     var sampleRate: Double { file.processingFormat.sampleRate }
+    /// 元のデータのビット深度 (整数の PCM とロスレス圧縮だけ。MP3 などの圧縮音源や浮動小数点の音源は nil)
+    var sourceBits: Int? {
+        let d = file.fileFormat.streamDescription.pointee
+        switch d.mFormatID {
+        case kAudioFormatLinearPCM: return d.mFormatFlags & kAudioFormatFlagIsFloat != 0 ? nil : Int(d.mBitsPerChannel)
+        case kAudioFormatFLAC, kAudioFormatAppleLossless: return [1: 16, 2: 20, 3: 24, 4: 32][d.mFormatFlags]
+        default: return nil
+        }
+    }
     var startFrame: AVAudioFramePosition { min(file.length, AVAudioFramePosition(start * sampleRate)) }
     var endFrame: AVAudioFramePosition {
         guard let end else { return file.length }
@@ -173,7 +182,7 @@ final class AudioEngine {
     private let offline: Bool
     /// 選ばれている出力デバイス (nil ならシステムの設定に従う)
     private var selectedDevice: AudioDeviceID?
-    /// デバイスのサンプルレートを曲に合わせて切り替える (切り替えられれば、サンプルレートの変換が入らない)
+    /// デバイスのサンプルレートとビット深度を曲に合わせて切り替える (合えば、サンプルレートの変換もビットの切り捨ても入らない)
     var matchSampleRate = false
     /// 出力デバイスを排他的に使う (ほかのアプリの音が混ざらない)
     /// (切り替えは setExclusiveMode で行う)
@@ -183,8 +192,9 @@ final class AudioEngine {
     private var switchingExclusive = false
     /// エンジンを始められなかった (出力デバイスが使えないなど)
     var onStartFailure: (() -> Void)?
-    /// こちらで切り替える前の、デバイスのサンプルレート (終了時に戻す)
+    /// こちらで切り替える前の、デバイスのサンプルレートと形式 (終了時に戻す)
     private var originalRates: [AudioDeviceID: Double] = [:]
+    private var originalFormats: [AudioDeviceID: AudioStreamBasicDescription] = [:]
     /// こちらでデバイスを切り替えている最中か (終わったあとで読み込み直すので、その間は立て直しをしない)
     private var reconfiguring = false
     /// 出力の構成が変わったあとの確認を予約してあるか
@@ -194,6 +204,8 @@ final class AudioEngine {
     private var stalledTicks = 0
     /// 直前にこちらで切り替えたサンプルレート (ほかのアプリに戻されたときに、取り合いを続けないため)
     private var lastRateSwitch: (target: Double, time: CFTimeInterval)?
+    /// 直前にこちらで切り替えたビット深度 (同じく、取り合いを続けないため)
+    private var lastDepthSwitch: (bits: Int, time: CFTimeInterval)?
     /// パラメトリック EQ の設定 (nil なら使わない)
     var eqProfile: EQProfile? { didSet { publishEQ() } }
 
@@ -360,28 +372,61 @@ final class AudioEngine {
         while !condition(), CACurrentMediaTime() < limit { try? await Task.sleep(for: .milliseconds(50)) }
     }
 
+    /// 曲に合わせるために、デバイスをどう切り替えるか (切り替えなくてよければ nil)。
+    /// サンプルレートは、同じ値があればそれ、なければ整数倍。
+    /// ビット深度は、今の形式では曲のデータを運びきれないときだけ上げる (16bit のデバイスに 24bit の曲など)
+    private func deviceSwitch(for item: PlaybackItem) -> (device: AudioDeviceID, rate: Double?, format: OutputDevice.PhysicalFormat?)? {
+        guard matchSampleRate, let device = currentDevice, let now = OutputDevice.nominalSampleRate(device) else { return nil }
+        var rate = now
+        if let best = OutputDevice.bestRate(for: item.sampleRate, available: OutputDevice.availableSampleRates(device)),
+           !wasJustReverted(from: best) { rate = best }
+        var format: OutputDevice.PhysicalFormat?
+        // ビット深度の決まっていない音源 (MP3 など) は、24bit あれば足りる
+        let needed = item.sourceBits ?? 24
+        // (足りているときは、デバイスが受け付ける形式の一覧までは読まない。曲の終わりぎわに繰り返し呼ばれるため)
+        if let current = OutputDevice.physicalFormat(device), current.precision < min(needed, 24) {
+            format = OutputDevice.betterFormat(needed: needed, current: current,
+                                               available: OutputDevice.availablePhysicalFormats(device, rate: rate))
+            if let wanted = format, let last = lastDepthSwitch, last.bits == wanted.bits, CACurrentMediaTime() - last.time < 10 {
+                format = nil
+            }
+        }
+        let rateChange = abs(now - rate) > 0.5 ? rate : nil
+        return rateChange == nil && format == nil ? nil : (device, rateChange, format)
+    }
+
     /// 曲を読み込む前に、出力側を整える。
-    /// 「サンプルレートを曲に合わせる」がオンなら、デバイスを曲に最も合うサンプルレートへ切り替える。
+    /// 「デバイスの形式を曲に合わせる」がオンなら、デバイスを曲に最も合うサンプルレートとビット深度へ切り替える。
     /// そのうえで、経路をデバイスのサンプルレートに合わせる
     @MainActor
     func prepareOutput(for item: PlaybackItem) async {
         guard !offline else { return }
         await wait(upTo: 6) { !switchingExclusive }
-        if matchSampleRate, let device = currentDevice,
-           let target = OutputDevice.bestRate(for: item.sampleRate, available: OutputDevice.availableSampleRates(device)),
-           let now = OutputDevice.nominalSampleRate(device), abs(now - target) > 0.5, !wasJustReverted(from: target) {
+        if let change = deviceSwitch(for: item) {
+            let device = change.device
             reconfiguring = true
             defer { reconfiguring = false }
-            if originalRates[device] == nil { originalRates[device] = now }
+            if originalRates[device] == nil { originalRates[device] = OutputDevice.nominalSampleRate(device) }
+            if originalFormats[device] == nil { originalFormats[device] = OutputDevice.physicalDescription(device) }
             decks.forEach { $0.stop() }
             engine.stop()
-            if OutputDevice.setNominalSampleRate(device, target) {
+            // ビット深度を上げるときは、形式ごと切り替える (サンプルレートも一緒に切り替わる)
+            var depth = change.format
+            if let format = depth, !OutputDevice.setPhysicalFormat(device, format) { depth = nil }
+            let target = depth?.rate ?? change.rate
+            if depth != nil || change.rate.map({ OutputDevice.setNominalSampleRate(device, $0) }) == true {
+                func settled() -> Bool {
+                    if let target, abs((OutputDevice.nominalSampleRate(device) ?? 0) - target) >= 0.5 { return false }
+                    if let depth, OutputDevice.physicalFormat(device)?.bits != depth.bits { return false }
+                    return true
+                }
                 // 切り替わるまで待つ (最長 2 秒)
-                await wait(upTo: 2) { abs((OutputDevice.nominalSampleRate(device) ?? 0) - target) < 0.5 }
+                await wait(upTo: 2) { settled() }
                 // 切り替えの通知が出そろうのを待つ
                 try? await Task.sleep(for: .milliseconds(150))
-                if abs((OutputDevice.nominalSampleRate(device) ?? 0) - target) < 0.5 {
-                    lastRateSwitch = (target, CACurrentMediaTime())
+                if settled() {
+                    if let rate = change.rate { lastRateSwitch = (rate, CACurrentMediaTime()) }
+                    if let depth { lastDepthSwitch = (depth.bits, CACurrentMediaTime()) }
                 }
             }
         }
@@ -441,12 +486,8 @@ final class AudioEngine {
         }
     }
 
-    /// 次の曲へそのまま続けて進めるか (サンプルレートを合わせる設定で、デバイスの切り替えが要るなら進めない)
-    private func canContinue(to next: PlaybackItem) -> Bool {
-        guard matchSampleRate, let device = currentDevice,
-              let target = OutputDevice.bestRate(for: next.sampleRate, available: OutputDevice.availableSampleRates(device)) else { return true }
-        return abs(target - deviceSampleRate) < 0.5
-    }
+    /// 次の曲へそのまま続けて進めるか (デバイスの形式を合わせる設定で、デバイスの切り替えが要るなら進めない)
+    private func canContinue(to next: PlaybackItem) -> Bool { deviceSwitch(for: next) == nil }
 
     /// 排他モードを取る / 手放す。うまくいったかを返す。
     ///
@@ -534,21 +575,32 @@ final class AudioEngine {
     /// 排他モードを取れているか
     var isExclusive: Bool { hoggedDevice != nil }
 
-    /// 切り替えたサンプルレートを元に戻す。終了時 (releaseExclusive) は、排他モードも手放す
+    /// 切り替えたサンプルレートと形式を元に戻す。終了時 (releaseExclusive) は、排他モードも手放す
     func restoreOutputDevice(releaseExclusive: Bool = false) {
         if releaseExclusive, let held = hoggedDevice {
             OutputDevice.setHog(held, false)
             hoggedDevice = nil
         }
-        for (device, rate) in originalRates { OutputDevice.setNominalSampleRate(device, rate) }
+        for (device, rate) in originalRates {
+            // ビット深度も変えていたら、形式ごと戻す (サンプルレートも一緒に戻る)
+            if let original = originalFormats[device], OutputDevice.physicalFormat(device)?.bits != Int(original.mBitsPerChannel) {
+                var format = original
+                format.mSampleRate = rate
+                if OutputDevice.setPhysicalDescription(device, format) { continue }
+            }
+            OutputDevice.setNominalSampleRate(device, rate)
+        }
         originalRates.removeAll()
+        originalFormats.removeAll()
+        lastRateSwitch = nil
+        lastDepthSwitch = nil
     }
 
-    /// 出力デバイスの情報 (名前・サンプルレート・ビット深度・つなぎ方)
-    var outputInfo: (name: String, rate: Double, bits: Int?, transport: String?) {
+    /// 出力デバイスの情報 (名前・サンプルレート・デバイスへ送る形式・つなぎ方)
+    var outputInfo: (name: String, rate: Double, format: OutputDevice.PhysicalFormat?, transport: String?) {
         guard let device = currentDevice else { return ("出力", deviceSampleRate, nil, nil) }
         return (OutputDevice.name(device) ?? "出力", OutputDevice.nominalSampleRate(device) ?? deviceSampleRate,
-                OutputDevice.physicalFormat(device)?.bits, OutputDevice.transport(device))
+                OutputDevice.physicalFormat(device), OutputDevice.transport(device))
     }
 
     // MARK: - 再生制御

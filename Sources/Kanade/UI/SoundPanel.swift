@@ -26,6 +26,16 @@ struct SoundPanel: View {
                 }
                 .padding(10)
                 .background(RoundedRectangle(cornerRadius: 10).fill(tint.opacity(0.12)))
+            } else if model.bitPerfect {
+                HStack(spacing: 8) {
+                    Image(systemName: "checkmark.seal").foregroundStyle(tint)
+                    Text("ビットパーフェクト再生中は、元のデータのまま出力するため EQ・ヘッドホンの補正・速度・キー・バランス・クロスフェード・音量の均一化はオフになっています（設定は残っています）。")
+                        .font(.callout).fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 0)
+                    Button("解除") { model.setBitPerfect(false) }.controlSize(.small)
+                }
+                .padding(10)
+                .background(RoundedRectangle(cornerRadius: 10).fill(tint.opacity(0.12)))
             }
 
             Picker("", selection: $tab) {
@@ -79,7 +89,7 @@ private struct EqualizerTab: View {
                 Toggle("", isOn: $m.eqEnabled).toggleStyle(.switch).labelsHidden().controlSize(.small)
                     .accessibilityLabel("イコライザー")
             }
-            .disabled(model.asmrMode)
+            .disabled(model.effectsOff)
 
             HStack(alignment: .bottom, spacing: 0) {
                 band(label: "PRE", value: $m.eqPreamp, tint: .white.opacity(0.8))
@@ -93,8 +103,8 @@ private struct EqualizerTab: View {
             }
             .frame(height: 176)
             .frame(maxWidth: .infinity)
-            .opacity(model.eqEnabled && !model.asmrMode ? 1 : 0.35)
-            .disabled(!model.eqEnabled || model.asmrMode)
+            .opacity(model.eqEnabled && !model.effectsOff ? 1 : 0.35)
+            .disabled(!model.eqEnabled || model.effectsOff)
 
             HStack {
                 note("ダブルクリックで各バンドを 0 に戻せます。すべて 0 のときは処理を通さず、元の音のまま出力します。")
@@ -174,8 +184,8 @@ private struct HeadphoneTab: View {
             }
             note("ヘッドホンで聴くと、左の音は左耳にしか届きません。スピーカーのように、反対側の耳にも低音を中心に少しだけ音を回して、頭の中で左右に張り付く感じを和らげます。")
         }
-        .disabled(model.asmrMode)
-        .opacity(model.asmrMode ? 0.45 : 1)
+        .disabled(model.effectsOff)
+        .opacity(model.effectsOff ? 0.45 : 1)
     }
 
     private func importFile() {
@@ -374,32 +384,37 @@ private struct PlaybackTab: View {
                         valueText(balanceLabel).onTapGesture(count: 2) { model.balance = 0 }
                     }
                 }
-                .disabled(model.asmrMode)
-                .opacity(model.asmrMode ? 0.4 : 1)
-                GridRow {
-                    settingLabel("クロスフェード", "wave.3.right")
-                    Slider(value: $m.crossfade, in: 0...12, step: 0.5)
-                    valueText(model.crossfade == 0 ? "オフ" : String(format: "%.1f秒", model.crossfade))
-                }
-                GridRow {
-                    settingLabel("音量の均一化", "speaker.wave.2")
-                    Picker("", selection: $m.replayGain) {
-                        ForEach(ReplayGainMode.allCases) { Text($0.label).tag($0) }
+                .disabled(model.effectsOff)
+                .opacity(model.effectsOff ? 0.4 : 1)
+                Group {
+                    GridRow {
+                        settingLabel("クロスフェード", "wave.3.right")
+                        Slider(value: $m.crossfade, in: 0...12, step: 0.5)
+                        valueText(model.crossfade == 0 ? "オフ" : String(format: "%.1f秒", model.crossfade))
                     }
-                    .pickerStyle(.segmented).labelsHidden().gridCellColumns(2)
-                    .accessibilityLabel("音量の均一化")
+                    GridRow {
+                        settingLabel("音量の均一化", "speaker.wave.2")
+                        Picker("", selection: $m.replayGain) {
+                            ForEach(ReplayGainMode.allCases) { Text($0.label).tag($0) }
+                        }
+                        .pickerStyle(.segmented).labelsHidden().gridCellColumns(2)
+                        .accessibilityLabel("音量の均一化")
+                    }
                 }
+                .disabled(model.bitPerfect)
+                .opacity(model.bitPerfect ? 0.4 : 1)
             }
 
             Toggle(isOn: $m.loudnessScan) {
                 Text("タグのない曲は、大きさを測ってそろえる").font(.callout)
             }
-            .disabled(model.replayGain == .off)
+            .disabled(model.replayGain == .off || model.bitPerfect)
             note("ReplayGain タグのない曲を、放送の基準と同じ測り方（EBU R128）で測り、-18 LUFS にそろえます。測った結果は保存され、次からはすぐに使われます。ASMR モードでは、音量のならしに任せるので使いません。")
 
             Toggle(isOn: $m.clipGuard) {
                 Text("クリップ防止").font(.callout)
             }
+            .disabled(model.bitPerfect)
             note("EQ・クロスフィード・速度の変更などで音が 0 dBFS を超えそうなときだけ、先読みして歪まないように抑えます。何も加工していないときは働かず、元の音を 1 ビットも変えません。")
 
             HStack {
@@ -445,14 +460,39 @@ private struct OutputTab: View {
                 .accessibilityLabel("出力デバイス")
             }
 
+            HStack(spacing: 10) {
+                Image(systemName: model.bitPerfect ? "checkmark.seal.fill" : "checkmark.seal")
+                    .font(.system(size: 20)).foregroundStyle(model.bitPerfect ? tint : .secondary)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("ビットパーフェクト再生").font(.callout.weight(.semibold))
+                    note("音を変える処理をすべて外し、デバイスの形式を曲に合わせて、元のデータのまま出力します。")
+                }
+                Spacer(minLength: 0)
+                Toggle("", isOn: Binding(get: { model.bitPerfect }, set: { model.setBitPerfect($0) }))
+                    .toggleStyle(.switch).labelsHidden()
+                    .accessibilityLabel("ビットパーフェクト再生")
+            }
+            .padding(12)
+            .background(RoundedRectangle(cornerRadius: 10).fill(model.bitPerfect ? tint.opacity(0.14) : .white.opacity(0.05)))
+            .help("⇧⌘B でも切り替えられます")
+            if let reason = model.bitPerfectShortfall {
+                Label(reason, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if model.bitPerfect {
+                note(model.volumeLocked
+                     ? "EQ などの設定は残っているので、オフにすれば元に戻ります。このデバイスの音量は Mac から変えられないので、アンプなどデバイス側で調整してください。"
+                     : "EQ などの設定は残っているので、オフにすれば元に戻ります。音量スライダーは、アプリの音量の代わりに出力デバイス側の音量を動かします。")
+            }
+
             SignalPathView(tint: tint)
 
             Divider().opacity(0.4)
 
-            Toggle(isOn: $m.matchSampleRate) {
-                Text("デバイスのサンプルレートを曲に合わせる").font(.callout)
+            Toggle(isOn: Binding(get: { model.matchSampleRate || model.bitPerfect }, set: { model.matchSampleRate = $0 })) {
+                Text("デバイスのサンプルレートとビット深度を曲に合わせる").font(.callout)
             }
-            note("曲ごとに、出力デバイスを曲と同じサンプルレート（なければその整数倍）へ切り替えます。合えばサンプルレートの変換が入らず、元のデータのまま出力できます。サンプルレートの違う曲へ移るときは、切り替えのために一瞬途切れます。終了時には元のサンプルレートに戻します。")
+            .disabled(model.bitPerfect)
+            note("曲ごとに、出力デバイスを曲と同じサンプルレート（なければその整数倍）へ切り替えます。デバイスが 16bit になっていて曲が 24bit のときなどは、ビット深度も上げます。合えばサンプルレートの変換もビットの切り捨ても入らず、元のデータのまま出力できます。形式の違う曲へ移るときは、切り替えのために一瞬途切れます。終了時には元の形式に戻します。")
 
             HStack(spacing: 8) {
                 Toggle(isOn: $m.exclusiveMode) {

@@ -24,6 +24,26 @@ enum Importer {
         var skipped = 0
     }
 
+    /// ライブラリに登録できる場所か (フォルダ、音源のファイル、CUE シート、プレイリスト)
+    static func isLibrarySource(_ url: URL, isDirectory: Bool) -> Bool {
+        let ext = url.pathExtension.lowercased()
+        return isDirectory || mediaExtensions.contains(ext) || playlistExtensions.contains(ext) || ext == "cue"
+    }
+
+    /// 曲をライブラリに入れるときに登録するファイル。
+    /// CUE シートで分けた曲は、音源ではなく CUE シートのほうを登録する (音源だけでは、曲に分かれないため)
+    static func librarySource(for track: Track) -> URL {
+        guard track.isCueTrack else { return track.url }
+        let dir = track.url.deletingLastPathComponent()
+        let sheets = ((try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? [])
+            .filter { $0.pathExtension.lowercased() == "cue" }
+            .map { dir.appendingPathComponent($0.lastPathComponent) }
+            .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+        let stem = track.url.deletingPathExtension().lastPathComponent.lowercased()
+        // 音源に埋め込まれた CUE シートで分けた曲は、CUE シートのファイルがないので音源を登録する
+        return sheets.first { $0.deletingPathExtension().lastPathComponent.lowercased() == stem } ?? sheets.first ?? track.url
+    }
+
     static func expand(_ urls: [URL]) -> Result {
         var files: [URL] = []
         var explicit = Set<URL>()
