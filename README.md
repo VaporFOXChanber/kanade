@@ -328,3 +328,7 @@ TimePitch と Varispeed は、速度やキーを変えているときだけ経�
 | `walkman.py` | `Skins/walkman` | ミニプレイヤーのポータブルカセットプレイヤー |
 
 共通の処理は `common.py`、カセットの形状は `cassette_model.py` にまとめてあり、ウォークマンの中のカセットにも使っています。VU メーターの目盛り板は `swift art/make-vu-face.swift art/textures/vu-face.png` で作ります。
+
+## ライセンス
+
+MIT License です（[LICENSE](LICENSE)）。ffmpeg は含んでいません（別に入れたものを呼び出します）。
