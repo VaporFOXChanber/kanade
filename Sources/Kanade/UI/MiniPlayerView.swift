@@ -5,7 +5,6 @@ import SwiftUI
 /// プレイヤーの見た目がカセットのときは、ポータブルカセットプレイヤーの姿になる。
 struct MiniPlayerView: View {
     @Environment(PlayerModel.self) private var model
-    @Environment(\.dismissWindow) private var dismissWindow
     @State private var hover = false
 
     private var walkman: Bool { model.skin == .cassette && SkinAssets.shared.available(.cassette) && WalkmanPlayer.available }
@@ -20,7 +19,7 @@ struct MiniPlayerView: View {
         }
         .overlay(alignment: walkman ? .topLeading : .topTrailing) {
             if hover {
-                Button { dismissWindow(id: "mini") } label: {
+                Button { MiniPlayerPanel.shared.close() } label: {
                     Image(systemName: "xmark").font(.system(size: 8, weight: .bold)).frame(width: 16, height: 16)
                         .background(.black.opacity(0.55), in: Circle())
                         .foregroundStyle(.white)
@@ -37,12 +36,11 @@ struct MiniPlayerView: View {
             .onEnded { _ in MiniWindowMover.shared.endDrag() })
         .contextMenu {
             Button("メインウィンドウを表示") { WindowOpener.showMain() }
-            Button("ミニプレイヤーを閉じる") { dismissWindow(id: "mini") }
+            Button("ミニプレイヤーを閉じる") { MiniPlayerPanel.shared.close() }
         }
         // 他のアプリを使っている最中でも、最初のクリックからドラッグやボタンが効くようにする
         .allowsWindowActivationEvents(true)
         .onHover { hover = $0 }
-        .background(WindowAccessor { MiniWindowMover.shared.attach($0) })
         .transaction { t in
             if model.powerSaving {
                 t.animation = nil
@@ -103,27 +101,56 @@ private struct MiniProgress: View {
     }
 }
 
-// MARK: - ウィンドウの移動
+// MARK: - ウィンドウ
 
-/// SwiftUI のビューが載っている NSWindow を受け取る
-private struct WindowAccessor: NSViewRepresentable {
-    let onWindow: (NSWindow) -> Void
-    func makeNSView(context: Context) -> AccessorView { AccessorView(onWindow: onWindow) }
-    func updateNSView(_ view: AccessorView, context: Context) {}
+/// ミニプレイヤーのウィンドウ。クリックしても Kanade を手前のアプリに切り替えないパネルにしてある。
+/// ふつうのウィンドウだと、別のアプリを使っている最中に動かしたりボタンを押したりするたびに Kanade が手前のアプリになり、
+/// 使っていたアプリから操作が離れて、メインウィンドウまで前に出てくることがある
+@MainActor
+final class MiniPlayerPanel {
+    static let shared = MiniPlayerPanel()
 
-    final class AccessorView: NSView {
-        let onWindow: (NSWindow) -> Void
-        init(onWindow: @escaping (NSWindow) -> Void) {
-            self.onWindow = onWindow
-            super.init(frame: .zero)
+    private var panel: NSPanel?
+
+    var isOpen: Bool { panel != nil }
+
+    func show() {
+        if let panel {
+            panel.orderFrontRegardless()
+            return
         }
-        required init?(coder: NSCoder) { fatalError() }
-        override func viewDidMoveToWindow() {
-            super.viewDidMoveToWindow()
-            if let window { onWindow(window) }
-        }
+        let content = NSHostingController(rootView: MiniPlayerView().environment(PlayerModel.shared))
+        // 見た目の切り替えで中身の大きさが変わったら、ウィンドウも合わせる
+        content.sizingOptions = [.preferredContentSize]
+        let p = NSPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        p.title = "ミニプレイヤー"
+        p.isReleasedWhenClosed = false
+        // ほかのアプリの「常に手前」のウィンドウよりも前に出す
+        p.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.utilityWindow)))
+        // Kanade が手前のアプリでない間も出したままにする (パネルは既定で隠れる)
+        p.hidesOnDeactivate = false
+        p.isOpaque = false
+        p.backgroundColor = .clear
+        p.appearance = NSAppearance(named: .darkAqua)
+        p.contentViewController = content
+        p.setContentSize(content.view.fittingSize)
+        MiniWindowMover.shared.attach(p)
+        p.orderFrontRegardless()
+        panel = p
+    }
+
+    func close() {
+        guard let p = panel else { return }
+        panel = nil
+        // 閉じている間は、中身を描き直さない
+        p.contentViewController = nil
+        p.close()
+        // ミニプレイヤーだけで使っていたときは、最後のウィンドウを閉じたときと同じように終了する
+        if !NSApp.windows.contains(where: { $0.isVisible || $0.isMiniaturized }) { NSApp.terminate(nil) }
     }
 }
+
+// MARK: - ウィンドウの移動
 
 /// ミニプレイヤーのウィンドウをドラッグで動かし、画面の端の近くで離すと端に吸い付かせる。
 /// 位置は覚えておき、次に開いたときも同じ場所に出す。
@@ -178,8 +205,7 @@ final class MiniWindowMover {
                 return consumed ? nil : event
             }
         }
-        // SwiftUI が既定の位置に置いたあとで、覚えておいた位置へ移す
-        DispatchQueue.main.async { [weak self] in self?.restore() }
+        restore()
     }
 
     func drag(translation: CGSize) {
@@ -245,6 +271,9 @@ final class MiniWindowMover {
         guard let w = window else { return }
         if let p = Defaults.array(positionKey) as? [Double], p.count == 2 {
             w.setFrameTopLeftPoint(CGPoint(x: p[0], y: p[1]))
+        } else if let vf = NSScreen.main?.visibleFrame {
+            // はじめて開くときは、画面の右上
+            w.setFrameTopLeftPoint(CGPoint(x: vf.maxX - w.frame.width - margin, y: vf.maxY - margin))
         }
         let f = snapped(w.frame, snap: false)
         w.setFrame(f, display: true)

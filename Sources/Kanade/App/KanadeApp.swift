@@ -24,14 +24,6 @@ struct KanadeApp: App {
         }
         .defaultSize(width: 1000, height: 660)
 
-        Window("ミニプレイヤー", id: "mini") {
-            MiniPlayerView().environment(model)
-        }
-        .windowStyle(.plain)
-        .windowLevel(.floating)
-        .windowResizability(.contentSize)
-        .defaultPosition(.topTrailing)
-
         Settings {
             SettingsView().environment(model)
         }
@@ -106,7 +98,7 @@ struct PlayerCommands: Commands {
             Button("ビジュアライザーを切り替え") { model.visualizer = model.visualizer.next }.keyboardShortcut("v", modifiers: [.command, .option])
             Button("イコライザー・音響効果…") { NotificationCenter.default.post(name: .kanadeShowSound, object: nil) }
                 .keyboardShortcut("e", modifiers: [.command, .option])
-            Button("ミニプレイヤー") { openWindow(id: "mini") }.keyboardShortcut("m", modifiers: [.command, .option])
+            Button("ミニプレイヤー") { MiniPlayerPanel.shared.show() }.keyboardShortcut("m", modifiers: [.command, .option])
             Button("ライブラリ") { openWindow(id: "library") }.keyboardShortcut("l", modifiers: [.command, .option])
             Divider()
         }
@@ -190,7 +182,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return true
     }
 
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    /// ミニプレイヤーだけを出して使っている間は、メインウィンドウを閉じても終了しない
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { !MiniPlayerPanel.shared.isOpen }
 
     func applicationWillTerminate(_ notification: Notification) {
         PlayerModel.shared.saveNow()

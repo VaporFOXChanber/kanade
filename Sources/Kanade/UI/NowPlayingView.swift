@@ -50,7 +50,7 @@ struct NowPlayingView: View {
             SkinMenu()
             IconButton(symbol: "books.vertical", size: 14, help: "ライブラリ (⌥⌘L)") { openWindow(id: "library") }
             IconButton(symbol: "plus", size: 14, help: "ファイル・フォルダを開く (⌘O)") { presentOpenPanel() }
-            IconButton(symbol: "pip.enter", size: 14, help: "ミニプレイヤー (⌥⌘M)") { openWindow(id: "mini") }
+            IconButton(symbol: "pip.enter", size: 14, help: "ミニプレイヤー (⌥⌘M)") { MiniPlayerPanel.shared.show() }
         }
         .padding(.horizontal, 16)
         .frame(height: 46)
